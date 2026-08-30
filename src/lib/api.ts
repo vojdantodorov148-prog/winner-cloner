@@ -54,6 +54,10 @@ export function downloadProxyUrl(url: string, filename: string) {
   return `/.netlify/functions/download?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(filename)}`
 }
 
+export function assetProxyUrl(url: string) {
+  return `/.netlify/functions/asset?url=${encodeURIComponent(url)}`
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
   const controller = new AbortController()
   const timer = window.setTimeout(() => controller.abort(), timeoutMs)

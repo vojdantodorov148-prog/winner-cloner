@@ -1,17 +1,14 @@
-# Deploy v1.0.4 to the existing Netlify site
+# Winner Cloner v1.0.5 — deploy
 
-## Fastest fix (recommended for the current Nano Banana workflow)
+This update changes the frontend and adds one Netlify Function for Copy / Download all.
 
-Replace only:
+## GitHub → Netlify
+1. Replace the repository files with the contents of this ZIP.
+2. Commit the changes.
+3. Netlify will auto-deploy the same site.
+4. Keep the existing `KIE_API_KEY` environment variable unchanged.
+5. Hard refresh `winner-cloner.netlify.app` after the deploy is Published.
 
-`netlify/functions/generate.js`
+Important: upload the new `netlify/functions/asset.js` file too. Copy and ZIP download use it.
 
-with the v1.0.4 version, commit to GitHub, and let Netlify redeploy.
-
-This fixes the 504 runtime chain immediately and does not change browser-stored products/winners.
-
-## Full update
-
-Replace the repository contents with v1.0.4 and commit. This also fixes the Grok Imagine model identifier in the frontend and local-state migration.
-
-Your existing `KIE_API_KEY` environment variable remains configured in Netlify and does not need to be entered again.
+Your saved Winners, Products and History stay in the browser because the Netlify domain remains the same.

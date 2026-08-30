@@ -9,6 +9,7 @@ import {
   Download,
   ExternalLink,
   FileImage,
+  FolderDown,
   Gauge,
   Image as ImageIcon,
   Images,
@@ -32,7 +33,7 @@ import {
 import AssetThumb from './components/AssetThumb'
 import Dropzone from './components/Dropzone'
 import Modal from './components/Modal'
-import { createGeneration, downloadProxyUrl, getCredits, getTaskStatus } from './lib/api'
+import { assetProxyUrl, createGeneration, downloadProxyUrl, getCredits, getTaskStatus } from './lib/api'
 import { deleteAsset, getAsset, loadState, optimizeDataUrl, saveAsset, saveState } from './lib/db'
 import type { AppState, Job, NavKey, Product, Winner } from './types'
 
@@ -96,7 +97,6 @@ function App() {
   const [generating, setGenerating] = useState(false)
   const [toast, setToast] = useState('')
   const [credits, setCredits] = useState<number | null>(null)
-  const [detailsJob, setDetailsJob] = useState<Job | null>(null)
   const pollingJobs = useRef(new Set<string>())
 
   useEffect(() => saveState(state), [state])
@@ -282,7 +282,6 @@ function App() {
         setToast(response.warning)
         setTimeout(() => setToast(''), 5000)
       }
-      setNav('results')
       await pollJob(id, response.taskIds)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Generation failed'
@@ -369,6 +368,55 @@ function App() {
     setNav('generate')
   }
 
+  const copyGeneratedImage = async (imageUrl: string) => {
+    try {
+      if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') throw new Error('Image copy is not supported in this browser.')
+      const pngPromise = (async () => {
+        const response = await fetch(assetProxyUrl(imageUrl))
+        if (!response.ok) throw new Error('Could not load the image for copy.')
+        return ensurePngBlob(await response.blob())
+      })()
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngPromise })])
+      setToast('Copied.')
+      setTimeout(() => setToast(''), 1800)
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : 'Could not copy image.')
+      setTimeout(() => setToast(''), 3200)
+    }
+  }
+
+  const downloadAllResults = async (job: Job) => {
+    const product = state.products.find((p) => p.id === job.productId)
+    const successful = job.results.filter((r) => r.status === 'success' && r.imageUrl)
+    if (!successful.length) return
+    try {
+      setToast('Preparing ZIP…')
+      const files = await Promise.all(successful.map(async (result) => {
+        const response = await fetch(assetProxyUrl(result.imageUrl!))
+        if (!response.ok) throw new Error(`Could not load variation ${result.variation}.`)
+        const extension = imageExtension(response.headers.get('content-type'))
+        return {
+          name: `${safeFileName(product?.name || 'creative')}-${safeFileName(job.market)}-v${result.variation}.${extension}`,
+          data: new Uint8Array(await response.arrayBuffer()),
+        }
+      }))
+      const zip = buildStoredZip(files)
+      const href = URL.createObjectURL(zip)
+      const a = document.createElement('a')
+      a.href = href
+      a.download = `${safeFileName(product?.name || 'creatives')}-${safeFileName(job.market)}.zip`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(href), 3000)
+      setToast('Downloaded.')
+      setTimeout(() => setToast(''), 1800)
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : 'Could not prepare ZIP.')
+      setTimeout(() => setToast(''), 3200)
+    }
+  }
+
   const refreshCredits = async () => {
     try {
       const data = await getCredits()
@@ -383,7 +431,7 @@ function App() {
     { key: 'generate' as const, label: 'Generate', icon: WandSparkles },
     { key: 'winners' as const, label: 'Winners', icon: Images },
     { key: 'products' as const, label: 'Products', icon: Package },
-    { key: 'results' as const, label: 'Results', icon: LayoutGrid },
+    { key: 'results' as const, label: 'History', icon: LayoutGrid },
     { key: 'settings' as const, label: 'Settings', icon: Settings },
   ]
 
@@ -392,7 +440,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><Zap size={19} fill="currentColor" /></div>
-          <div><strong>Winner Cloner</strong><span>Static Ad Engine</span></div>
+          <div><strong>Winner Cloner</strong></div>
         </div>
         <nav>
           {sidebar.map(({ key, label, icon: Icon }) => (
@@ -403,13 +451,10 @@ function App() {
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <div className="locked-system">
-            <div className="locked-icon"><LockKeyhole size={16} /></div>
-            <div><strong>Prompt Master</strong><span>Always ON</span></div>
-            <Check size={15} />
-          </div>
-          <div className="sidebar-stats">
-            <span>{state.winners.length} winners</span><span>{state.products.length} products</span>
+          <div className="locked-system minimal-lock">
+            <LockKeyhole size={14} />
+            <strong>Prompt Master ON</strong>
+            <Check size={14} />
           </div>
         </div>
       </aside>
@@ -418,7 +463,6 @@ function App() {
         <header className="topbar">
           <div className="mobile-brand"><Zap size={17} fill="currentColor" /> Winner Cloner</div>
           <div className="topbar-spacer" />
-          <div className="status-pill"><span className="green-dot" /> Kie backend ready</div>
           {credits !== null && <div className="credits-pill">{credits.toLocaleString()} credits</div>}
         </header>
 
@@ -448,6 +492,8 @@ function App() {
             generate={generate}
             generating={generating}
             latestJob={latestJob}
+            copyImage={copyGeneratedImage}
+            downloadAll={downloadAllResults}
           />
         )}
 
@@ -476,8 +522,9 @@ function App() {
             jobs={state.jobs}
             winners={state.winners}
             products={state.products}
-            openDetails={setDetailsJob}
             reuse={regenerateFromJob}
+            copyImage={copyGeneratedImage}
+            downloadAll={downloadAllResults}
           />
         )}
 
@@ -493,7 +540,6 @@ function App() {
 
       <ProductEditor product={productEditor} setProduct={setProductEditor} onClose={closeProductEditor} onSave={persistProduct} />
       <WinnerEditor winner={winnerEditor} setWinner={setWinnerEditor} onClose={closeWinnerEditor} onSave={persistWinner} />
-      <JobDetails job={detailsJob} winner={detailsJob ? state.winners.find((w) => w.id === detailsJob.winnerId) : undefined} product={detailsJob ? state.products.find((p) => p.id === detailsJob.productId) : undefined} onClose={() => setDetailsJob(null)} />
 
       {toast && <div className="toast">{toast}</div>}
     </div>
@@ -525,139 +571,116 @@ function GeneratePage(props: {
   generate: () => void
   generating: boolean
   latestJob?: Job
+  copyImage: (url: string) => void | Promise<void>
+  downloadAll: (job: Job) => void | Promise<void>
 }) {
   const winner = props.state.winners.find((w) => w.id === props.selectedWinnerId)
   const product = props.state.products.find((p) => p.id === props.selectedProductId)
-  const cloneLabel = props.cloneStrength >= 90 ? 'Very close' : props.cloneStrength >= 75 ? 'Controlled variation' : props.cloneStrength >= 55 ? 'Inspired' : 'Loose concept'
 
   return (
-    <div className="page page-generate">
-      <div className="page-title-row">
-        <div><div className="eyebrow">Production</div><h1>Clone a proven winner</h1><p>Pick the source ad and product. Prompt Master handles the analysis, adaptation and generation instructions behind the scenes.</p></div>
-        <div className="pm-badge"><ShieldCheck size={17} /><div><strong>Prompt Master locked ON</strong><span>Every generation runs through the master workflow</span></div></div>
+    <div className="page page-generate minimal-page">
+      <div className="minimal-titlebar">
+        <h1>Generate</h1>
+        <div className="pm-inline"><LockKeyhole size={13} /> Prompt Master ON</div>
       </div>
 
-      <div className="generate-grid">
-        <section className="panel control-panel">
-          <StepHeader number="01" title="Source winner" subtitle="The structure and visual logic to preserve" />
-          <div className="select-with-action">
-            <select value={props.selectedWinnerId} onChange={(e) => props.setSelectedWinnerId(e.target.value)}>
-              <option value="">Select a saved winner</option>
-              {props.state.winners.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
-            </select>
-            <button className="square-btn" onClick={() => props.setWinnerEditor(emptyWinner())}><Plus size={18} /></button>
-          </div>
-          {winner ? (
-            <div className="selected-source">
-              <AssetThumb assetId={winner.assetId} alt={winner.name} className="selected-source-img" />
-              <div><strong>{winner.name}</strong><span>{winner.sourceMarket || 'Market not tagged'} · {winner.format}</span><button className="text-link" onClick={() => props.setWinnerEditor({ ...winner })}>Edit winner</button></div>
-            </div>
-          ) : <div className="empty-inline"><ImageIcon size={18} /> Add your first proven static ad in Winners.</div>}
-
-          <div className="divider" />
-          <StepHeader number="02" title="Product" subtitle="All saved context is injected automatically" />
-          <div className="select-with-action">
-            <select value={props.selectedProductId} onChange={(e) => props.setSelectedProductId(e.target.value)}>
-              <option value="">Select product</option>
-              {props.state.products.map((p) => <option key={p.id} value={p.id}>{p.brand ? `${p.brand} — ` : ''}{p.name}</option>)}
-            </select>
-            <button className="square-btn" onClick={() => props.setProductEditor(emptyProduct())}><Plus size={18} /></button>
-          </div>
-          {product ? (
-            <div className="selected-product">
-              <AssetThumb assetId={product.assetIds[0]} alt={product.name} className="product-thumb" />
-              <div className="selected-product-main"><strong>{product.name}</strong><span>{product.summary || 'No summary yet'}</span></div>
-              <button className="icon-btn subtle" onClick={() => props.setProductEditor({ ...product, links: { ...product.links }, assetIds: [...product.assetIds] })}><Pencil size={16} /></button>
-            </div>
-          ) : <div className="empty-inline"><Package size={18} /> Create a product profile with product photos first.</div>}
-
-          <div className="divider" />
-          <StepHeader number="03" title="Generation setup" subtitle="Control the output without touching the Prompt Master" />
-          <div className="field-grid two">
-            <Field label="Market">
-              <select value={props.market} onChange={(e) => props.setMarket(e.target.value)}>{markets.map((m) => <option key={m}>{m}</option>)}</select>
-            </Field>
-            <Field label="Output language">
-              <select value={props.outputLanguage} onChange={(e) => props.setOutputLanguage(e.target.value)}>
-                <option>Auto — market native</option><option>English</option><option>Croatian</option><option>Greek</option><option>Hungarian</option><option>Bulgarian</option><option>Romanian</option><option>German</option><option>Macedonian</option>
+      <div className="minimal-generate-grid">
+        <section className="panel minimal-input-panel">
+          <div className="input-section">
+            <div className="input-section-title">Winner</div>
+            <div className="select-with-action">
+              <select value={props.selectedWinnerId} onChange={(e) => props.setSelectedWinnerId(e.target.value)}>
+                <option value="">Select winner</option>
+                {props.state.winners.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
               </select>
-            </Field>
-            <Field label="Aspect ratio">
-              <div className="segmented">{['4:5', '1:1', '9:16', '16:9'].map((r) => <button key={r} className={props.aspectRatio === r ? 'active' : ''} onClick={() => props.setAspectRatio(r)}>{r}</button>)}</div>
-            </Field>
-            <Field label="Variations">
-              <div className="segmented">{[1, 2, 4, 6].map((v) => <button key={v} className={props.variations === v ? 'active' : ''} onClick={() => props.setVariations(v)}>{v}</button>)}</div>
-            </Field>
+              <button className="square-btn" onClick={() => props.setWinnerEditor(emptyWinner())} title="Add winner"><Plus size={18} /></button>
+            </div>
+            {winner && <div className="compact-selected"><AssetThumb assetId={winner.assetId} alt={winner.name} className="compact-selected-img" /><strong>{winner.name}</strong><button className="icon-btn subtle" onClick={() => props.setWinnerEditor({ ...winner })} title="Edit winner"><Pencil size={15} /></button></div>}
           </div>
 
-          <Field label="Image model">
-            <select value={props.model} onChange={(e) => props.setModel(e.target.value)}>{models.map((m) => <option key={m.value} value={m.value}>{m.label} — {m.note}</option>)}</select>
-          </Field>
-
-          <div className="range-field">
-            <div className="range-head"><label>Clone strength</label><div><strong>{props.cloneStrength}%</strong><span>{cloneLabel}</span></div></div>
-            <input type="range" min="35" max="100" value={props.cloneStrength} onChange={(e) => props.setCloneStrength(Number(e.target.value))} />
-            <div className="range-labels"><span>More original</span><span>Closer to winner</span></div>
+          <div className="input-section">
+            <div className="input-section-title">Product</div>
+            <div className="select-with-action">
+              <select value={props.selectedProductId} onChange={(e) => props.setSelectedProductId(e.target.value)}>
+                <option value="">Select product</option>
+                {props.state.products.map((p) => <option key={p.id} value={p.id}>{p.brand ? `${p.brand} — ` : ''}{p.name}</option>)}
+              </select>
+              <button className="square-btn" onClick={() => props.setProductEditor(emptyProduct())} title="Add product"><Plus size={18} /></button>
+            </div>
+            {product && <div className="compact-selected"><AssetThumb assetId={product.assetIds[0]} alt={product.name} className="compact-selected-img" /><strong>{product.name}</strong><button className="icon-btn subtle" onClick={() => props.setProductEditor({ ...product, links: { ...product.links }, assetIds: [...product.assetIds] })} title="Edit product"><Pencil size={15} /></button></div>}
           </div>
 
-          <Field label="Extra instructions" hint="Optional. Prompt Master still stays active.">
-            <textarea rows={4} value={props.extraNotes} onChange={(e) => props.setExtraNotes(e.target.value)} placeholder="Example: larger product, shorter supporting copy, woman 45+, more native / less polished..." />
-          </Field>
+          <div className="input-section setup-section">
+            <div className="input-section-title">Setup</div>
+            <div className="field-grid two compact-fields">
+              <Field label="Market"><select value={props.market} onChange={(e) => props.setMarket(e.target.value)}>{markets.map((m) => <option key={m}>{m}</option>)}</select></Field>
+              <Field label="Language"><select value={props.outputLanguage} onChange={(e) => props.setOutputLanguage(e.target.value)}><option>Auto — market native</option><option>English</option><option>Croatian</option><option>Greek</option><option>Hungarian</option><option>Bulgarian</option><option>Romanian</option><option>German</option><option>Macedonian</option></select></Field>
+              <Field label="Format"><div className="segmented">{['4:5', '1:1', '9:16', '16:9'].map((r) => <button type="button" key={r} className={props.aspectRatio === r ? 'active' : ''} onClick={() => props.setAspectRatio(r)}>{r}</button>)}</div></Field>
+              <Field label="Variations"><div className="segmented">{[1, 2, 4, 6].map((v) => <button type="button" key={v} className={props.variations === v ? 'active' : ''} onClick={() => props.setVariations(v)}>{v}</button>)}</div></Field>
+            </div>
+            <Field label="Model"><select value={props.model} onChange={(e) => props.setModel(e.target.value)}>{models.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}</select></Field>
+            <div className="minimal-range"><div><span>Fidelity</span><strong>{props.cloneStrength}%</strong></div><input type="range" min="35" max="100" value={props.cloneStrength} onChange={(e) => props.setCloneStrength(Number(e.target.value))} /></div>
+            <Field label="Notes"><textarea rows={3} value={props.extraNotes} onChange={(e) => props.setExtraNotes(e.target.value)} placeholder="Optional instructions…" /></Field>
+          </div>
 
-          <button className="generate-btn" disabled={props.generating || !winner || !product} onClick={props.generate}>
-            {props.generating ? <LoaderCircle className="spin" size={19} /> : <Sparkles size={19} />}
-            {props.generating ? 'Building & generating…' : `Generate ${props.variations} clone${props.variations > 1 ? 's' : ''}`}
+          <button className="generate-btn minimal-generate-btn" disabled={props.generating || !winner || !product} onClick={props.generate}>
+            {props.generating ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}
+            {props.generating ? 'Generating…' : `Generate ${props.variations}`}
           </button>
-          <div className="generate-foot"><LockKeyhole size={13} /> Winner analysis → product context → Prompt Master → image model</div>
         </section>
 
-        <section className="preview-column">
-          <div className="panel preview-panel">
-            <div className="panel-head"><div><div className="eyebrow">Live setup</div><h3>Generation blueprint</h3></div><Gauge size={19} /></div>
-            <div className="blueprint-stage">
-              {winner ? <AssetThumb assetId={winner.assetId} alt={winner.name} className="blueprint-image" /> : <div className="blueprint-empty"><FileImage size={34} /><span>Your winner preview appears here</span></div>}
-              <div className="blueprint-overlay"><span>REFERENCE</span></div>
-            </div>
-            <div className="blueprint-list">
-              <BlueprintRow label="Structure" value={winner ? 'Preserve hierarchy & placement' : 'Waiting for winner'} locked />
-              <BlueprintRow label="Product context" value={product ? `${product.name} profile + ${product.assetIds.length} asset${product.assetIds.length === 1 ? '' : 's'}` : 'Waiting for product'} locked />
-              <BlueprintRow label="Market" value={`${props.market} · ${props.outputLanguage}`} />
-              <BlueprintRow label="Fidelity" value={`${props.cloneStrength}% · ${cloneLabel}`} />
-              <BlueprintRow label="Output" value={`${props.variations} × ${props.aspectRatio} · ${models.find((m) => m.value === props.model)?.label}`} />
-            </div>
-          </div>
-
-          <div className="panel system-panel">
-            <div className="system-title"><div className="system-icon"><LockKeyhole size={18} /></div><div><strong>Prompt Master system</strong><span>Cannot be disabled</span></div><span className="on-chip">ON</span></div>
-            <div className="system-flow">
-              <span>Analyze winner</span><ChevronRight size={14} /><span>Extract structure</span><ChevronRight size={14} /><span>Adapt offer</span><ChevronRight size={14} /><span>Generate</span>
-            </div>
-            <p>It preserves the winner’s copy length, visual hierarchy, persuasive flow and CTA logic, then rebuilds the concept around the selected product and market.</p>
-          </div>
-
-          {props.latestJob && (
-            <div className="panel latest-panel">
-              <div><span className={`job-status ${props.latestJob.status}`}>{props.latestJob.status}</span><strong>Latest generation</strong></div>
-              <span>{new Date(props.latestJob.createdAt).toLocaleString()}</span>
-            </div>
-          )}
-        </section>
+        <OutputPanel job={props.latestJob} product={props.latestJob ? props.state.products.find((p) => p.id === props.latestJob!.productId) : product} copyImage={props.copyImage} downloadAll={props.downloadAll} />
       </div>
     </div>
+  )
+}
+
+function OutputPanel({ job, product, copyImage, downloadAll }: { job?: Job; product?: Product; copyImage: (url: string) => void | Promise<void>; downloadAll: (job: Job) => void | Promise<void> }) {
+  const successes = job?.results.filter((r) => r.status === 'success' && r.imageUrl) || []
+  const isActive = !!job && ['queued', 'analyzing', 'prompting', 'generating'].includes(job.status)
+  return (
+    <section className="panel output-panel">
+      <div className="output-head">
+        <div><h2>Output</h2>{job && <span className={`simple-status ${job.status}`}>{isActive ? 'Generating' : job.status === 'completed' ? 'Done' : 'Failed'}</span>}</div>
+        {job && successes.length > 1 && <button className="secondary-btn compact-action" onClick={() => downloadAll(job)}><FolderDown size={15} /> Download all</button>}
+      </div>
+
+      {!job && <div className="output-empty"><ImageIcon size={28} /><span>Output appears here.</span></div>}
+
+      {job && job.status === 'failed' && job.results.length === 0 && <div className="output-error">{job.promptSummary || 'Generation failed.'}</div>}
+
+      {job && job.results.length === 0 && job.status !== 'failed' && <div className="output-empty active"><LoaderCircle className="spin" size={26} /><span>Generating…</span></div>}
+
+      {job && job.results.length > 0 && <div className={`output-grid count-${Math.min(job.results.length, 6)}`}>
+        {job.results.map((result) => (
+          <div className="output-card" key={result.taskId}>
+            <div className="output-image-wrap">
+              {result.status === 'success' && result.imageUrl ? <a href={result.imageUrl} target="_blank" rel="noreferrer"><img src={result.imageUrl} alt={`Variation ${result.variation}`} /></a> : <div className="output-placeholder"><LoaderCircle className={result.status === 'fail' ? '' : 'spin'} size={24} /><span>{result.status === 'fail' ? 'Failed' : 'Generating'}</span></div>}
+              {job.results.length > 1 && <span className="variation-chip">{result.variation}</span>}
+            </div>
+            {result.status === 'success' && result.imageUrl && <div className="output-actions">
+              <button onClick={() => copyImage(result.imageUrl!)}><Copy size={15} /> Copy</button>
+              <a href={downloadProxyUrl(result.imageUrl, `${safeFileName(product?.name || 'creative')}-${safeFileName(job.market)}-v${result.variation}.png`)}><Download size={15} /> Download</a>
+            </div>}
+            {result.status === 'fail' && <div className="output-card-error">{result.error || 'Failed'}</div>}
+          </div>
+        ))}
+      </div>}
+    </section>
   )
 }
 
 function WinnersPage({ winners, addWinnerFiles, edit, remove, select }: { winners: Winner[]; addWinnerFiles: (files: File[]) => void; edit: (w: Winner) => void; remove: (w: Winner) => void; select: (w: Winner) => void }) {
   return (
     <div className="page">
-      <div className="page-title-row compact"><div><div className="eyebrow">Library</div><h1>Winning ads</h1><p>Save proven static ads once, then reuse them across products and markets.</p></div></div>
-      <Dropzone label="Upload winning ads" hint="Multiple PNG, JPG or WebP files · you can also paste a screenshot anywhere in the app" multiple onFiles={addWinnerFiles} />
-      {winners.length === 0 ? <EmptyState icon={<Images size={27} />} title="No winners yet" text="Add the first proven ad. The source image remains the reference every time you generate a clone." /> : (
+      <div className="page-title-row compact"><div><h1>Winners</h1></div></div>
+      <Dropzone label="Upload winners" multiple onFiles={addWinnerFiles} />
+      {winners.length === 0 ? <EmptyState icon={<Images size={27} />} title="No winners yet" text="Upload a winning ad." /> : (
         <div className="library-grid">
           {winners.map((winner) => (
             <article className="library-card" key={winner.id}>
               <div className="library-image-wrap"><AssetThumb assetId={winner.assetId} alt={winner.name} className="library-image" /><span className="format-chip">{winner.format}</span></div>
-              <div className="library-card-body"><strong>{winner.name}</strong><span>{winner.sourceMarket || 'Unspecified market'} · {winner.platform}</span><div className="tagline">{winner.tags || 'No tags'}</div></div>
+              <div className="library-card-body"><strong>{winner.name}</strong>{winner.sourceMarket && <span>{winner.sourceMarket}</span>}</div>
               <div className="library-actions"><button onClick={() => select(winner)}><WandSparkles size={15} /> Use</button><button onClick={() => edit(winner)}><Pencil size={15} /></button><button onClick={() => remove(winner)}><Trash2 size={15} /></button></div>
             </article>
           ))}
@@ -670,13 +693,13 @@ function WinnersPage({ winners, addWinnerFiles, edit, remove, select }: { winner
 function ProductsPage({ products, edit, remove, create, select }: { products: Product[]; edit: (p: Product) => void; remove: (p: Product) => void; create: () => void; select: (p: Product) => void }) {
   return (
     <div className="page">
-      <div className="page-title-row compact"><div><div className="eyebrow">Library</div><h1>Products</h1><p>Build the product context once. Edit it anytime; every future Prompt Master run uses the latest profile.</p></div><button className="primary-btn" onClick={create}><Plus size={17} /> New product</button></div>
-      {products.length === 0 ? <EmptyState icon={<Package size={27} />} title="No products yet" text="Create a detailed product profile with photos, offer, audience, objections, pages and guardrails." action={<button className="primary-btn" onClick={create}><Plus size={17} /> Create product</button>} /> : (
+      <div className="page-title-row compact"><div><h1>Products</h1></div><button className="primary-btn" onClick={create}><Plus size={17} /> New product</button></div>
+      {products.length === 0 ? <EmptyState icon={<Package size={27} />} title="No products yet" text="Create a product profile." action={<button className="primary-btn" onClick={create}><Plus size={17} /> Create product</button>} /> : (
         <div className="product-list">
           {products.map((product) => (
             <article className="product-row" key={product.id}>
               <AssetThumb assetId={product.assetIds[0]} alt={product.name} className="product-row-img" />
-              <div className="product-row-main"><div><strong>{product.name}</strong>{product.brand && <span className="brand-chip">{product.brand}</span>}</div><p>{product.summary || product.description || 'No product description yet.'}</p><div className="row-meta"><span>{product.assetIds.length} images</span><span>{product.offer || 'Offer not set'}</span><span>{product.audience ? 'Audience set' : 'Audience missing'}</span></div></div>
+              <div className="product-row-main"><div><strong>{product.name}</strong>{product.brand && <span className="brand-chip">{product.brand}</span>}</div><p>{product.summary || product.description || 'No description'}</p></div>
               <div className="row-actions"><button className="primary-quiet" onClick={() => select(product)}><WandSparkles size={15} /> Use</button><button className="icon-btn" onClick={() => edit(product)}><Pencil size={16} /></button><button className="icon-btn danger" onClick={() => remove(product)}><Trash2 size={16} /></button></div>
             </article>
           ))}
@@ -686,37 +709,36 @@ function ProductsPage({ products, edit, remove, create, select }: { products: Pr
   )
 }
 
-function ResultsPage({ jobs, winners, products, openDetails, reuse }: { jobs: Job[]; winners: Winner[]; products: Product[]; openDetails: (j: Job) => void; reuse: (j: Job) => void }) {
+function ResultsPage({ jobs, winners, products, reuse, copyImage, downloadAll }: { jobs: Job[]; winners: Winner[]; products: Product[]; reuse: (j: Job) => void; copyImage: (url: string) => void | Promise<void>; downloadAll: (job: Job) => void | Promise<void> }) {
   const [filter, setFilter] = useState<'all' | 'completed' | 'active'>('all')
   const visible = jobs.filter((j) => filter === 'all' || (filter === 'completed' ? j.status === 'completed' : ['queued', 'analyzing', 'prompting', 'generating'].includes(j.status)))
   return (
     <div className="page">
-      <div className="page-title-row compact"><div><div className="eyebrow">Output</div><h1>Results</h1><p>Every run stays grouped by winner, product, market and generation settings.</p></div><div className="segmented small">{(['all', 'completed', 'active'] as const).map((f) => <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}>{f}</button>)}</div></div>
-      {visible.length === 0 ? <EmptyState icon={<LayoutGrid size={27} />} title="No generations here" text="Generate your first clone from the Generate tab." /> : (
+      <div className="page-title-row compact"><h1>History</h1><div className="segmented small">{(['all', 'completed', 'active'] as const).map((f) => <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}>{f}</button>)}</div></div>
+      {visible.length === 0 ? <EmptyState icon={<LayoutGrid size={27} />} title="No generations" text="Generate a creative first." /> : (
         <div className="jobs-list">
           {visible.map((job) => {
             const winner = winners.find((w) => w.id === job.winnerId)
             const product = products.find((p) => p.id === job.productId)
-            const successes = job.results.filter((r) => r.status === 'success')
+            const successes = job.results.filter((r) => r.status === 'success' && r.imageUrl)
             return (
-              <article className="job-card" key={job.id}>
+              <article className="job-card compact-job" key={job.id}>
                 <div className="job-head">
-                  <div className="job-head-left"><div className={`job-state-icon ${job.status}`}>{job.status === 'completed' ? <Check size={17} /> : job.status === 'failed' ? <X size={17} /> : <LoaderCircle size={17} className={job.status === 'generating' ? 'spin' : ''} />}</div><div><strong>{product?.name || 'Deleted product'} <span>×</span> {winner?.name || 'Deleted winner'}</strong><p>{job.market} · {job.aspectRatio} · {models.find((m) => m.value === job.model)?.label || job.model} · {job.cloneStrength}% fidelity</p></div></div>
-                  <div className="job-head-actions"><span>{new Date(job.createdAt).toLocaleString()}</span><button className="icon-btn" onClick={() => reuse(job)} title="Reuse settings"><RefreshCw size={16} /></button><button className="icon-btn" onClick={() => openDetails(job)}><MoreHorizontal size={17} /></button></div>
+                  <div className="job-head-left"><div className={`job-state-icon ${job.status}`}>{job.status === 'completed' ? <Check size={17} /> : job.status === 'failed' ? <X size={17} /> : <LoaderCircle size={17} className="spin" />}</div><div><strong>{product?.name || 'Deleted product'} <span>×</span> {winner?.name || 'Deleted winner'}</strong><p>{job.market} · {job.aspectRatio} · {job.cloneStrength}%</p></div></div>
+                  <div className="job-head-actions">{successes.length > 1 && <button className="icon-btn" onClick={() => downloadAll(job)} title="Download all"><FolderDown size={16} /></button>}<button className="icon-btn" onClick={() => reuse(job)} title="Reuse"><RefreshCw size={16} /></button></div>
                 </div>
-                {job.status === 'failed' && job.results.length === 0 ? <div className="job-error">{job.promptSummary || 'The generation could not start.'}</div> : (
+                {job.status === 'failed' && job.results.length === 0 ? <div className="job-error">{job.promptSummary || 'Generation failed.'}</div> : (
                   <div className="result-strip">
-                    {job.results.length === 0 && <div className="result-loading"><LoaderCircle className="spin" size={19} /> Prompt Master is analyzing the winner and product…</div>}
+                    {job.results.length === 0 && <div className="result-loading"><LoaderCircle className="spin" size={19} /> Generating…</div>}
                     {job.results.map((result) => (
                       <div className="result-tile" key={result.taskId}>
                         {result.status === 'success' && result.imageUrl ? <img src={result.imageUrl} alt={`Variation ${result.variation}`} /> : <div className="result-placeholder"><LoaderCircle className={result.status !== 'fail' ? 'spin' : ''} size={22} /><span>{result.status === 'fail' ? 'Failed' : 'Generating'}</span></div>}
-                        <span className="variation-chip">V{result.variation}</span>
-                        {result.status === 'success' && result.imageUrl && <div className="result-actions"><a href={downloadProxyUrl(result.imageUrl, `${product?.name || 'creative'}-${job.market}-v${result.variation}.png`)}><Download size={15} /> Download</a><a href={result.imageUrl} target="_blank" rel="noreferrer"><ExternalLink size={15} /></a></div>}
+                        <span className="variation-chip">{result.variation}</span>
+                        {result.status === 'success' && result.imageUrl && <div className="result-actions"><button onClick={() => copyImage(result.imageUrl!)}><Copy size={15} /> Copy</button><a href={downloadProxyUrl(result.imageUrl, `${safeFileName(product?.name || 'creative')}-${safeFileName(job.market)}-v${result.variation}.png`)}><Download size={15} /> Download</a></div>}
                       </div>
                     ))}
                   </div>
                 )}
-                {successes.length > 0 && <div className="job-footer"><span>{successes.length}/{job.variations} generated</span><button className="text-link" onClick={() => openDetails(job)}>View Prompt Master summary</button></div>}
               </article>
             )
           })}
@@ -731,9 +753,9 @@ function SettingsPage({ defaults, setDefaults, credits, refreshCredits }: { defa
   useEffect(() => setDraft(defaults), [defaults])
   return (
     <div className="page settings-page">
-      <div className="page-title-row compact"><div><div className="eyebrow">System</div><h1>Settings</h1><p>Set defaults for new jobs. Prompt Master cannot be turned off.</p></div></div>
+      <div className="page-title-row compact"><h1>Settings</h1></div>
       <div className="settings-grid">
-        <section className="panel settings-card"><div className="panel-head"><div><h3>Generation defaults</h3><p>Pre-filled each time you open Generate.</p></div><Settings size={19} /></div>
+        <section className="panel settings-card"><div className="panel-head"><h3>Defaults</h3><Settings size={19} /></div>
           <div className="field-grid two">
             <Field label="Market"><select value={draft.market} onChange={(e) => setDraft({ ...draft, market: e.target.value })}>{markets.map((m) => <option key={m}>{m}</option>)}</select></Field>
             <Field label="Language"><select value={draft.outputLanguage} onChange={(e) => setDraft({ ...draft, outputLanguage: e.target.value })}><option>Auto — market native</option><option>English</option><option>Croatian</option><option>Greek</option><option>Hungarian</option><option>Bulgarian</option><option>Romanian</option><option>German</option><option>Macedonian</option></select></Field>
@@ -744,11 +766,11 @@ function SettingsPage({ defaults, setDefaults, credits, refreshCredits }: { defa
           <Field label={`Clone strength — ${draft.cloneStrength}%`}><input type="range" min="35" max="100" value={draft.cloneStrength} onChange={(e) => setDraft({ ...draft, cloneStrength: Number(e.target.value) })} /></Field>
           <button className="primary-btn" onClick={() => setDefaults(draft)}><Save size={16} /> Save defaults</button>
         </section>
-        <section className="panel settings-card"><div className="panel-head"><div><h3>Kie.ai connection</h3><p>The API key is read only from Netlify environment variables.</p></div><LockKeyhole size={19} /></div>
-          <div className="connection-box"><div><span className="green-dot" /><strong>Server-side key</strong></div><p>Set <code>KIE_API_KEY</code> in Netlify → Site configuration → Environment variables. Never put the key into GitHub or frontend code.</p></div>
+        <section className="panel settings-card"><div className="panel-head"><h3>Kie.ai</h3><LockKeyhole size={19} /></div>
+          <div className="connection-box"><div><span className="green-dot" /><strong>Connected server-side</strong></div></div>
           <div className="credits-card"><span>Account credits</span><strong>{credits === null ? '—' : credits.toLocaleString()}</strong><button className="secondary-btn" onClick={refreshCredits}><RefreshCw size={15} /> Check credits</button></div>
         </section>
-        <section className="panel settings-card master-settings"><div className="system-title"><div className="system-icon"><ShieldCheck size={18} /></div><div><strong>Prompt Master</strong><span>Core system workflow</span></div><span className="on-chip">LOCKED ON</span></div><p>The master workflow is built into the serverless generation function. Every job analyzes the winner, combines product context, adapts the copy and creates the final image-generation prompt before any image task is submitted.</p><div className="locked-note"><LockKeyhole size={15} /> There is intentionally no OFF switch.</div></section>
+        <section className="panel settings-card master-settings compact-master"><div className="system-title"><div className="system-icon"><ShieldCheck size={18} /></div><strong>Prompt Master</strong><span className="on-chip">ON</span></div></section>
       </div>
     </div>
   )
@@ -770,13 +792,13 @@ function ProductEditor({ product, setProduct, onClose, onSave }: { product: Prod
   return (
     <Modal open title={product.name || 'New product'} onClose={onClose} wide>
       <div className="editor-tabs">{tabs.map((t) => <button key={t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>{t}</button>)}</div>
-      {tab === 'Overview' && <div className="editor-section"><div className="field-grid two"><Field label="Product name"><input value={product.name} onChange={(e) => update('name', e.target.value)} placeholder="Alpine Sleep" /></Field><Field label="Brand"><input value={product.brand} onChange={(e) => update('brand', e.target.value)} placeholder="Alpine Patches" /></Field><Field label="Category"><input value={product.category} onChange={(e) => update('category', e.target.value)} placeholder="Sleep patches" /></Field><Field label="One-line summary"><input value={product.summary} onChange={(e) => update('summary', e.target.value)} placeholder="What it is, in one sentence" /></Field></div><Field label="Explain the product in your own words" hint="Write freely. This is high-priority Prompt Master context."><textarea rows={7} value={product.description} onChange={(e) => update('description', e.target.value)} placeholder="Describe what it is, who buys it, why they buy it, what makes it different, what you want the ads to communicate..." /></Field><Field label="How it works / mechanism"><textarea rows={4} value={product.mechanism} onChange={(e) => update('mechanism', e.target.value)} /></Field><Field label="Main benefits"><textarea rows={5} value={product.benefits} onChange={(e) => update('benefits', e.target.value)} placeholder="One benefit per line works well." /></Field></div>}
+      {tab === 'Overview' && <div className="editor-section"><div className="field-grid two"><Field label="Product name"><input value={product.name} onChange={(e) => update('name', e.target.value)} placeholder="Alpine Sleep" /></Field><Field label="Brand"><input value={product.brand} onChange={(e) => update('brand', e.target.value)} placeholder="Alpine Patches" /></Field><Field label="Category"><input value={product.category} onChange={(e) => update('category', e.target.value)} placeholder="Sleep patches" /></Field><Field label="One-line summary"><input value={product.summary} onChange={(e) => update('summary', e.target.value)} placeholder="What it is, in one sentence" /></Field></div><Field label="Explain the product in your own words"><textarea rows={7} value={product.description} onChange={(e) => update('description', e.target.value)} placeholder="Describe what it is, who buys it, why they buy it, what makes it different, what you want the ads to communicate..." /></Field><Field label="How it works / mechanism"><textarea rows={4} value={product.mechanism} onChange={(e) => update('mechanism', e.target.value)} /></Field><Field label="Main benefits"><textarea rows={5} value={product.benefits} onChange={(e) => update('benefits', e.target.value)} placeholder="One benefit per line works well." /></Field></div>}
       {tab === 'Offer' && <div className="editor-section"><Field label="Offer"><textarea rows={5} value={product.offer} onChange={(e) => update('offer', e.target.value)} placeholder="Price, old price, 2+1 FREE, bundle structure, shipping..." /></Field><Field label="Guarantee"><textarea rows={4} value={product.guarantee} onChange={(e) => update('guarantee', e.target.value)} placeholder="30-day guarantee, terms, risk reversal..." /></Field></div>}
       {tab === 'Audience' && <div className="editor-section"><Field label="Primary audience / avatar"><textarea rows={6} value={product.audience} onChange={(e) => update('audience', e.target.value)} placeholder="Age, gender, awareness, situation, pains, desired outcome..." /></Field><Field label="Customer objections / fears / critiques"><textarea rows={7} value={product.objections} onChange={(e) => update('objections', e.target.value)} placeholder="Why they hesitate, failed alternatives, Reddit-style objections, trust issues..." /></Field></div>}
-      {tab === 'Assets' && <div className="editor-section"><Dropzone label="Add product reference images" hint="Package, product, logo, ingredients or lifestyle · up to 8 stored images" multiple onFiles={addAssets} /><div className="asset-editor-grid">{product.assetIds.map((id, idx) => <div className="asset-edit-card" key={id}><AssetThumb assetId={id} alt={`Product asset ${idx + 1}`} className="asset-edit-img" /><button onClick={() => removeAsset(id)}><X size={15} /></button><span>{idx === 0 ? 'Primary' : `Ref ${idx + 1}`}</span></div>)}</div><p className="editor-help">The first image is treated as the primary product reference. Prompt Master receives up to the first three product images during generation to keep requests fast and reliable.</p></div>}
-      {tab === 'Pages' && <div className="editor-section"><p className="editor-help top">These pages are fetched server-side when possible and added as extra Prompt Master context.</p><Field label="Landing page URL"><input value={product.links.landing} onChange={(e) => update('links', { ...product.links, landing: e.target.value })} placeholder="https://..." /></Field><Field label="Advertorial URL"><input value={product.links.advertorial} onChange={(e) => update('links', { ...product.links, advertorial: e.target.value })} placeholder="https://..." /></Field><Field label="Offer page URL"><input value={product.links.offerPage} onChange={(e) => update('links', { ...product.links, offerPage: e.target.value })} placeholder="https://..." /></Field><Field label="Checkout URL"><input value={product.links.checkout} onChange={(e) => update('links', { ...product.links, checkout: e.target.value })} placeholder="https://..." /></Field></div>}
+      {tab === 'Assets' && <div className="editor-section"><Dropzone label="Add product images" multiple onFiles={addAssets} /><div className="asset-editor-grid">{product.assetIds.map((id, idx) => <div className="asset-edit-card" key={id}><AssetThumb assetId={id} alt={`Product asset ${idx + 1}`} className="asset-edit-img" /><button onClick={() => removeAsset(id)}><X size={15} /></button><span>{idx === 0 ? 'Primary' : `Ref ${idx + 1}`}</span></div>)}</div></div>}
+      {tab === 'Pages' && <div className="editor-section"><Field label="Landing page URL"><input value={product.links.landing} onChange={(e) => update('links', { ...product.links, landing: e.target.value })} placeholder="https://..." /></Field><Field label="Advertorial URL"><input value={product.links.advertorial} onChange={(e) => update('links', { ...product.links, advertorial: e.target.value })} placeholder="https://..." /></Field><Field label="Offer page URL"><input value={product.links.offerPage} onChange={(e) => update('links', { ...product.links, offerPage: e.target.value })} placeholder="https://..." /></Field><Field label="Checkout URL"><input value={product.links.checkout} onChange={(e) => update('links', { ...product.links, checkout: e.target.value })} placeholder="https://..." /></Field></div>}
       {tab === 'Guardrails' && <div className="editor-section"><Field label="Claims / words / creative rules to avoid"><textarea rows={10} value={product.guardrails} onChange={(e) => update('guardrails', e.target.value)} placeholder="Unsupported claims, wording you do not want, Meta policy constraints, visual rules, market-specific restrictions..." /></Field></div>}
-      {tab === 'Notes' && <div className="editor-section"><Field label="Research & free-form notes" hint="Anything not covered elsewhere."><textarea rows={16} value={product.notes} onChange={(e) => update('notes', e.target.value)} placeholder="Positioning, competitor observations, winning angles, copy notes, ingredient details..." /></Field></div>}
+      {tab === 'Notes' && <div className="editor-section"><Field label="Research & free-form notes"><textarea rows={16} value={product.notes} onChange={(e) => update('notes', e.target.value)} placeholder="Positioning, competitor observations, winning angles, copy notes, ingredient details..." /></Field></div>}
       <div className="editor-footer"><button className="secondary-btn" onClick={onClose}>Cancel</button><button className="primary-btn" disabled={!product.name.trim()} onClick={() => onSave(product)}><Save size={16} /> Save product</button></div>
     </Modal>
   )
@@ -812,5 +834,77 @@ function StepHeader({ number, title, subtitle }: { number: string; title: string
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) { return <label className="field"><div className="field-label"><span>{label}</span>{hint && <small>{hint}</small>}</div>{children}</label> }
 function BlueprintRow({ label, value, locked }: { label: string; value: string; locked?: boolean }) { return <div className="blueprint-row"><span>{label}</span><strong>{value}</strong>{locked && <LockKeyhole size={13} />}</div> }
 function EmptyState({ icon, title, text, action }: { icon: ReactNode; title: string; text: string; action?: ReactNode }) { return <div className="empty-state"><div className="empty-state-icon">{icon}</div><h3>{title}</h3><p>{text}</p>{action}</div> }
+
+
+async function ensurePngBlob(blob: Blob) {
+  if (blob.type === 'image/png') return blob
+  const bitmap = await createImageBitmap(blob)
+  const canvas = document.createElement('canvas')
+  canvas.width = bitmap.width
+  canvas.height = bitmap.height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Could not prepare image for copy.')
+  ctx.drawImage(bitmap, 0, 0)
+  bitmap.close()
+  return await new Promise<Blob>((resolve, reject) => canvas.toBlob((out) => out ? resolve(out) : reject(new Error('Could not prepare image for copy.')), 'image/png'))
+}
+
+function safeFileName(value: string) {
+  return value.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'creative'
+}
+
+function imageExtension(contentType: string | null) {
+  const type = (contentType || '').toLowerCase()
+  if (type.includes('webp')) return 'webp'
+  if (type.includes('jpeg') || type.includes('jpg')) return 'jpg'
+  return 'png'
+}
+
+type ZipFile = { name: string; data: Uint8Array }
+function buildStoredZip(files: ZipFile[]) {
+  const encoder = new TextEncoder()
+  const locals: Uint8Array[] = []
+  const centrals: Uint8Array[] = []
+  let offset = 0
+  for (const file of files) {
+    const name = encoder.encode(file.name)
+    const crc = crc32(file.data)
+    const local = concatBytes([
+      le32(0x04034b50), le16(20), le16(0), le16(0), le16(0), le16(0),
+      le32(crc), le32(file.data.length), le32(file.data.length), le16(name.length), le16(0), name, file.data,
+    ])
+    locals.push(local)
+    centrals.push(concatBytes([
+      le32(0x02014b50), le16(20), le16(20), le16(0), le16(0), le16(0), le16(0),
+      le32(crc), le32(file.data.length), le32(file.data.length), le16(name.length), le16(0), le16(0),
+      le16(0), le16(0), le32(0), le32(offset), name,
+    ]))
+    offset += local.length
+  }
+  const central = concatBytes(centrals)
+  const end = concatBytes([
+    le32(0x06054b50), le16(0), le16(0), le16(files.length), le16(files.length),
+    le32(central.length), le32(offset), le16(0),
+  ])
+  return new Blob([...locals, central, end], { type: 'application/zip' })
+}
+
+function concatBytes(chunks: Uint8Array[]) {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+  const out = new Uint8Array(length)
+  let offset = 0
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length }
+  return out
+}
+function le16(value: number) { const out = new Uint8Array(2); new DataView(out.buffer).setUint16(0, value, true); return out }
+function le32(value: number) { const out = new Uint8Array(4); new DataView(out.buffer).setUint32(0, value >>> 0, true); return out }
+function crc32(data: Uint8Array) {
+  let crc = 0xffffffff
+  for (const byte of data) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
 
 export default App
