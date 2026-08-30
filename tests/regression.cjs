@@ -2,6 +2,8 @@ const assert = require('assert')
 
 process.env.KIE_API_KEY = 'test-key'
 process.env.PROMPT_MASTER_TIMEOUT_MS = '80'
+process.env.IMAGE_TASK_TIMEOUT_MS = '80'
+process.env.IMAGE_TASK_RETRY_DELAY_MS = '1'
 
 function jsonResponse(obj, status = 200, headers = {}) {
   return new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json', ...headers } })
@@ -182,6 +184,50 @@ async function testPartialTaskCreationStillReturnsSuccess() {
   assert.ok(body.warning)
 }
 
+
+async function testBlankTaskIdRetriesAndRecovers() {
+  delete require.cache[require.resolve('../netlify/functions/generate.js')]
+  const generate = require('../netlify/functions/generate.js')
+  let createCalls = 0
+  global.fetch = async (url) => {
+    const u = String(url)
+    if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
+    if (u.includes('gemini-2.5-pro')) return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'ok', final_image_prompt: 'Create a finished static ad that preserves the winner layout, hierarchy, product placement, text density and product fidelity while adapting the copy for the selected market.' }) } }] })
+    if (u.includes('/api/v1/jobs/createTask')) {
+      createCalls++
+      if (createCalls === 1) return jsonResponse({ code: 500, msg: 'generate playground failed, task id is blank', data: {} })
+      return jsonResponse({ code: 200, msg: 'success', data: { taskId: 'task-after-blank-id-retry' } })
+    }
+    throw new Error(`Unexpected fetch ${u}`)
+  }
+  const out = await generate.handler({ httpMethod: 'POST', body: JSON.stringify(basePayload({ variations: 1 })) })
+  assert.equal(out.statusCode, 200, out.body)
+  assert.equal(createCalls, 2)
+  assert.deepEqual(JSON.parse(out.body).taskIds, ['task-after-blank-id-retry'])
+}
+
+async function testBlankTaskIdFailsCleanlyAfterRetry() {
+  delete require.cache[require.resolve('../netlify/functions/generate.js')]
+  const generate = require('../netlify/functions/generate.js')
+  let createCalls = 0
+  global.fetch = async (url) => {
+    const u = String(url)
+    if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
+    if (u.includes('gemini-2.5-pro')) return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'ok', final_image_prompt: 'Create a finished static ad that preserves the winner layout, hierarchy, product placement, text density and product fidelity while adapting the copy for the selected market.' }) } }] })
+    if (u.includes('/api/v1/jobs/createTask')) {
+      createCalls++
+      return jsonResponse({ code: 500, msg: 'generate playground failed, task id is blank', data: {} })
+    }
+    throw new Error(`Unexpected fetch ${u}`)
+  }
+  const out = await generate.handler({ httpMethod: 'POST', body: JSON.stringify(basePayload({ variations: 1 })) })
+  assert.equal(out.statusCode, 500, out.body)
+  assert.equal(createCalls, 2)
+  const body = JSON.parse(out.body)
+  assert.ok(/automatic retry/i.test(body.error))
+  assert.ok(/task id is blank/i.test(body.error))
+}
+
 async function testStatusNeverReturnsInputReference() {
   delete require.cache[require.resolve('../netlify/functions/status.js')]
   const status = require('../netlify/functions/status.js')
@@ -288,6 +334,8 @@ async function main() {
     testDeterministicPromptMasterSafetyFallback,
     testPromptMasterTimeoutFallsBackWithinBudget,
     testPartialTaskCreationStillReturnsSuccess,
+    testBlankTaskIdRetriesAndRecovers,
+    testBlankTaskIdFailsCleanlyAfterRetry,
     testStatusNeverReturnsInputReference,
     testStatusSuccessWithoutUrlKeepsPolling,
     testStatusFailure,

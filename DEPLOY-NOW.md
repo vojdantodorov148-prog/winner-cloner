@@ -1,4 +1,4 @@
-# Winner Cloner v1.0.5 — deploy
+# Winner Cloner v1.0.6 — deploy
 
 This update changes the frontend and adds one Netlify Function for Copy / Download all.
 

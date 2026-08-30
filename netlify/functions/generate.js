@@ -5,6 +5,8 @@ const net = require('net')
 const KIE_BASE = 'https://api.kie.ai'
 const UPLOAD_BASE = 'https://kieai.redpandaai.co'
 const PROMPT_MASTER_TIMEOUT_MS = Number(process.env.PROMPT_MASTER_TIMEOUT_MS || 18000)
+const IMAGE_TASK_TIMEOUT_MS = Number(process.env.IMAGE_TASK_TIMEOUT_MS || 6500)
+const IMAGE_TASK_RETRY_DELAY_MS = Number(process.env.IMAGE_TASK_RETRY_DELAY_MS || 1300)
 
 exports.handler = async (event) => {
   if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' })
@@ -24,7 +26,7 @@ exports.handler = async (event) => {
     ])
     const pageContextPromise = collectPageContext(body.product.links || {})
     const [[winnerUrl, ...productUrls], pageContext] = await Promise.all([uploadsPromise, pageContextPromise])
-    console.log('Winner Cloner v1.0.4 preparation ms', Date.now() - startedAt)
+    console.log('Winner Cloner v1.0.6 preparation ms', Date.now() - startedAt)
 
     const master = await runPromptMaster({ ...body, winnerUrl, productUrls, pageContext }, key)
 
@@ -41,7 +43,7 @@ exports.handler = async (event) => {
       return createImageTask(body.model, prompt, refs, body.aspectRatio, key)
     })
     const taskAttempts = await runSettledInBatches(taskFactories, 6)
-    console.log('Winner Cloner v1.0.4 total create ms', Date.now() - startedAt, 'promptMode', master.mode || 'unknown')
+    console.log('Winner Cloner v1.0.6 total create ms', Date.now() - startedAt, 'promptMode', master.mode || 'unknown')
 
     const taskIds = taskAttempts.filter((r) => r.status === 'fulfilled').map((r) => r.value)
     const failed = taskAttempts.filter((r) => r.status === 'rejected')
@@ -296,15 +298,61 @@ async function createImageTask(model, prompt, refs, aspectRatio, key) {
     throw new Error(`Unsupported image model: ${model}`)
   }
 
-  const { response, data } = await fetchJsonWithRetry(`${KIE_BASE}/api/v1/jobs/createTask`, {
+  const request = {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: effectiveModel, input }),
-  }, { timeoutMs: 7000, retries: 0 })
-  if (!response.ok || (data.code && Number(data.code) !== 200)) throw new Error(`Image task failed: ${data.msg || response.status}`)
-  const id = data?.data?.taskId
-  if (!id) throw new Error('Image task did not return a taskId.')
-  return id
+  }
+
+  let lastMessage = ''
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await sleep(IMAGE_TASK_RETRY_DELAY_MS)
+
+    try {
+      const { response, data } = await fetchJsonWithRetry(`${KIE_BASE}/api/v1/jobs/createTask`, request, {
+        timeoutMs: IMAGE_TASK_TIMEOUT_MS,
+        retries: 0,
+      })
+
+      const id = data?.data?.taskId
+      const codeOk = !data?.code || Number(data.code) === 200
+      if (response.ok && codeOk && id) return id
+
+      lastMessage = String(data?.msg || data?.error?.message || `HTTP ${response.status}`)
+      const retryable = isRetryableImageTaskFailure(response.status, data, lastMessage, Boolean(id))
+      if (attempt === 0 && retryable) {
+        console.warn('Image task creation failed transiently; retrying once', { model: effectiveModel, status: response.status, code: data?.code, msg: lastMessage })
+        continue
+      }
+      break
+    } catch (err) {
+      lastMessage = cleanError(err)
+      if (attempt === 0 && isRetryableImageTaskFailure(0, null, lastMessage, false)) {
+        console.warn('Image task creation request failed transiently; retrying once', { model: effectiveModel, msg: lastMessage })
+        continue
+      }
+      break
+    }
+  }
+
+  throw new Error(`Kie could not start ${friendlyModelName(effectiveModel)} after an automatic retry. ${lastMessage ? `Provider message: ${lastMessage}` : 'No task ID was returned.'}`)
+}
+
+function isRetryableImageTaskFailure(httpStatus, data, message, hasTaskId) {
+  if (hasTaskId) return false
+  const code = Number(data?.code || 0)
+  const text = String(message || '').toLowerCase()
+  if ([408, 425, 429].includes(httpStatus) || httpStatus >= 500) return true
+  if ([408, 425, 429, 500, 502, 503, 504].includes(code)) return true
+  return /task id is blank|taskid.*blank|playground failed|temporar|timeout|timed out|busy|overload|upstream|gateway|internal|try again|network|fetch failed|aborted/.test(text)
+}
+
+function friendlyModelName(model) {
+  if (model === 'nano-banana-pro') return 'Nano Banana Pro'
+  if (model === 'nano-banana-2') return 'Nano Banana 2'
+  if (model === 'gpt-image-2-image-to-image') return 'GPT Image 2'
+  if (model === 'grok-imagine-image-2-0/image-to-image') return 'Grok Imagine 2.0'
+  return model
 }
 
 async function collectPageContext(links) {
@@ -334,7 +382,7 @@ async function fetchSafePage(rawUrl) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 4000)
   try {
-    const response = await fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'User-Agent': 'WinnerCloner/1.0.4' } })
+    const response = await fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'User-Agent': 'WinnerCloner/1.0.6' } })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const contentType = response.headers.get('content-type') || ''
     if (!contentType.includes('text/html') && !contentType.includes('text/plain')) throw new Error('Page is not text/HTML')

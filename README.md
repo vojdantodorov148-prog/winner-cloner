@@ -1,4 +1,4 @@
-# Winner Cloner v1.0.5
+# Winner Cloner v1.0.6
 
 Minimal winner-ad cloning workflow.
 
@@ -7,7 +7,7 @@ Winner + Product + Setup → Generate → Output on the same page.
 
 Prompt Master stays permanently enabled in the backend.
 
-## v1.0.5
+## v1.0.6
 - Redesigned Generate UI: less text, fewer panels, faster input flow.
 - Output now appears directly beside the inputs on the Generate page.
 - Each generated creative has Copy and Download actions.
