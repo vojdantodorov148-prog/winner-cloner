@@ -41,7 +41,7 @@ const models = [
   { value: 'nano-banana-pro', label: 'Nano Banana Pro', note: 'Recommended · strongest reference fidelity' },
   { value: 'nano-banana-2', label: 'Nano Banana 2', note: 'Faster Google option' },
   { value: 'gpt-image-2-image-to-image', label: 'GPT Image 2', note: 'Strong text + composition' },
-  { value: 'grok-imagine-image-2-0/image-edit', label: 'Grok Imagine 2.0', note: 'Alternative visual interpretation' },
+  { value: 'grok-imagine-image-2-0/image-to-image', label: 'Grok Imagine 2.0', note: 'Alternative visual interpretation' },
 ]
 
 const emptyProduct = (): Product => ({
@@ -362,7 +362,7 @@ function App() {
     setMarket(job.market)
     setOutputLanguage(job.outputLanguage)
     setAspectRatio(job.aspectRatio)
-    setModel(job.model === 'grok-imagine-image-2-0/image-to-image' ? 'grok-imagine-image-2-0/image-edit' : job.model)
+    setModel(job.model === 'grok-imagine-image-2-0/image-edit' ? 'grok-imagine-image-2-0/image-to-image' : job.model)
     setVariations(job.variations)
     setCloneStrength(job.cloneStrength)
     setExtraNotes(job.extraNotes)

@@ -19,7 +19,7 @@ export async function createGeneration(payload: GeneratePayload) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-  }, 59_000)
+  }, 52_000)
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body?.error || friendlyHttpError(res.status, 'Generation request failed'))
   if (!Array.isArray(body?.taskIds) || !body.taskIds.length) throw new Error('Generation started but no image task IDs were returned. Retry once.')
@@ -72,6 +72,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 function friendlyHttpError(status: number, fallback: string) {
   if (status === 413) return 'The image request is too large. Re-upload the winner/product images so the app can compress them, then retry.'
   if (status === 429) return 'Too many requests. Wait a moment and retry.'
+  if (status === 504) return `${fallback}. The Netlify function exceeded its execution window or an upstream gateway timed out.`
   if (status >= 500) return `${fallback}. The AI backend or Netlify function returned ${status}.`
   return `${fallback} (${status})`
 }

@@ -1,126 +1,35 @@
-# Winner Cloner
+# Winner Cloner v1.0.4
 
-A deployable React + Netlify Functions app for cloning high-performing static ad concepts. The Prompt Master workflow is permanently enabled server-side: winner analysis → product/context adaptation → final image prompt → Kie.ai image generation.
+Winner Cloner turns a proven static-ad reference into product-specific variations through one UI workflow:
 
-## What is included
+**Winner → Product → Market / Format / Model / Variations / Clone Strength → Generate**
 
-- Generate screen: winner + product + market + language + ratio + model + variation count + clone strength
-- Prompt Master always ON and not exposed as a toggle
-- Winners Library with multiple upload and paste-from-clipboard
-- Detailed editable Products Library with product explanation, mechanism, benefits, offer, guarantee, audience, objections, guardrails, notes, reference images and URLs
-- Product/winner image persistence in browser IndexedDB
-- Results/jobs history in browser localStorage
-- Kie.ai server-side integration through Netlify Functions
-- Prompt Master: Gemini 2.5 Pro multimodal through Kie.ai
-- Image models: Nano Banana Pro, Nano Banana 2, GPT Image 2 image-to-image, Grok Imagine Image 2.0 image edit/reference mode
-- Polling for Kie job completion
-- Working server-side image download proxy
-- Kie credit check in Settings
-- Safe server-side page fetching for landing/advertorial/offer/checkout context (best effort)
+## Prompt Master
 
-## Important architecture note
+Prompt Master is permanently active. Every generation first attempts a multimodal Gemini 2.5 Pro Prompt Master pass. To prevent Netlify 504 timeouts, v1.0.4 performs only one bounded Prompt Master API call. If that call fails or exceeds its 18-second budget, the app automatically compiles the same Prompt Master rules into the downstream image-generation prompt and continues instead of failing the job.
 
-This first production-ready build is intentionally single-user and does **not** need Supabase. Product/winner metadata is stored in the browser and images use IndexedDB. The Kie API key stays on the Netlify server and is never exposed in frontend code.
+## Deploy
 
-If you later want shared team access, cross-device sync or permanent cloud asset storage, add Supabase without changing the generation pipeline.
+1. Push the project contents to GitHub.
+2. Import the repository in Netlify.
+3. Set environment variable `KIE_API_KEY` in Netlify.
+4. Deploy.
 
-## Deploy — recommended GitHub + Netlify
+Netlify settings are already in `netlify.toml`:
 
-### 1. Upload this project to GitHub
+- Build: `npm run build`
+- Publish: `dist`
+- Functions: `netlify/functions`
 
-Create a new empty GitHub repository (for example `winner-cloner`). Upload all files from this folder, or push with Git.
+## Storage
 
-Do **not** add a Kie API key to the repository.
+Products, winners, settings, and result metadata are stored in browser local storage / IndexedDB. Kie reference uploads are temporary.
 
-### 2. Import the repository in Netlify
+## Current image models
 
-In Netlify:
+- Nano Banana Pro
+- Nano Banana 2
+- GPT Image 2 image-to-image
+- Grok Imagine Image 2.0 image-to-image
 
-1. Add new site → Import an existing project
-2. Choose GitHub
-3. Select the `winner-cloner` repository
-4. Build command: `npm run build`
-5. Publish directory: `dist`
-6. Functions directory: `netlify/functions`
-7. Deploy
-
-`netlify.toml` already contains these settings, so Netlify should detect them automatically.
-
-### 3. Add the Kie secret
-
-Netlify → your site → Site configuration → Environment variables → Add variable:
-
-- Key: `KIE_API_KEY`
-- Value: your private Kie.ai API key
-
-Save it.
-
-### 4. Redeploy
-
-Deploys → Trigger deploy → Deploy site.
-
-The app should now be live and the Kie backend should work.
-
-## First test
-
-1. Open Winners → upload one proven static ad
-2. Open Products → New product
-3. Fill the product explanation and add at least one real product/package image
-4. Add offer, audience, objections and page URLs if available
-5. Save
-6. Go to Generate
-7. Select the winner and product
-8. Keep `Nano Banana Pro`, `4:5`, 4 variations and ~92% clone strength for the first test
-9. Generate
-10. Results will show the job while it is processing, then display each image with a Download button
-
-## Local development
-
-```bash
-npm install
-npm run dev
-```
-
-The visual app will run locally, but Kie generation calls require Netlify Functions. For full local functions support, use Netlify's local dev environment or deploy to a Netlify draft site.
-
-## Storage behavior
-
-The app stores product/winner data in the current browser. Clearing browser site data removes the local library. Generated Kie image URLs are external and may expire according to Kie.ai retention policies, so download important outputs.
-
-## Security
-
-- Kie key: server environment variable only
-- No Kie key is written to localStorage
-- Product page URL fetching blocks localhost/private-network targets
-- Download proxy only accepts Kie-related asset hosts
-
-## v1.0.3 reliability audit
-
-This build includes a full generation-pipeline hardening pass:
-
-- Prompt Master structured-response parser + automatic recovery remains always ON.
-- Kie status parsing reads generated URLs from `resultJson` only, so an input/winner reference URL cannot be mistaken for the finished creative.
-- A Kie `success` state without a result URL continues polling instead of completing a blank result.
-- Unfinished jobs resume polling after page refresh/reopen.
-- Polling uses backoff and a 15-minute timeout with explicit result errors.
-- Kie calls use request timeouts and retries for transient provider/network errors.
-- Image task creation tolerates partial task failures instead of discarding successful tasks.
-- Prompt length is capped per model before task creation.
-- Uploaded browser images are resized/compressed to reduce oversized Netlify request failures.
-- Winner/product asset replacement no longer deletes the previous saved image before Save, so Cancel cannot break an existing library item.
-- Grok Imagine 2.0 uses Kie’s current reference-image `grok-imagine-image-2-0/image-edit` model ID with `image_urls`; saved older `image-to-image` IDs are migrated automatically.
-- Downloads use Kie’s authenticated generated-file download-link API.
-- Top-level package versions are pinned for more repeatable Netlify builds.
-- Regression suite covers Prompt Master response variants/recovery/schema fallback, partial image-task creation, result URL parsing, no-URL success states, model request shapes/migration, credits and downloads.
-
-
-See `AUDIT-REPORT.md` for the v1.0.3 reliability audit and verification limitations.
-
-
-## v1.0.3 Prompt Master hotfix
-
-- Corrected the Kie Gemini structured-output request envelope to `response_format.json_schema.schema`.
-- Added Gemini 2.5 Flash multimodal recovery if the Pro response is empty or malformed.
-- Added a deterministic Prompt Master safety prompt so malformed chat output no longer hard-fails generation.
-- Kept Prompt Master permanently enabled; all fallbacks still preserve winner-reference and product-reference rules.
-- Regression suite expanded to 11 scenarios.
+See `AUDIT-REPORT.md` for the v1.0.4 runtime audit.

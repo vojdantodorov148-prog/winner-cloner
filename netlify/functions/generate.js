@@ -4,6 +4,7 @@ const net = require('net')
 
 const KIE_BASE = 'https://api.kie.ai'
 const UPLOAD_BASE = 'https://kieai.redpandaai.co'
+const PROMPT_MASTER_TIMEOUT_MS = Number(process.env.PROMPT_MASTER_TIMEOUT_MS || 18000)
 
 exports.handler = async (event) => {
   if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' })
@@ -11,6 +12,7 @@ exports.handler = async (event) => {
   if (!key) return json(500, { error: 'Missing KIE_API_KEY in Netlify environment variables.' })
 
   try {
+    const startedAt = Date.now()
     const body = JSON.parse(event.body || '{}')
     validate(body)
 
@@ -22,6 +24,7 @@ exports.handler = async (event) => {
     ])
     const pageContextPromise = collectPageContext(body.product.links || {})
     const [[winnerUrl, ...productUrls], pageContext] = await Promise.all([uploadsPromise, pageContextPromise])
+    console.log('Winner Cloner v1.0.4 preparation ms', Date.now() - startedAt)
 
     const master = await runPromptMaster({ ...body, winnerUrl, productUrls, pageContext }, key)
 
@@ -38,6 +41,7 @@ exports.handler = async (event) => {
       return createImageTask(body.model, prompt, refs, body.aspectRatio, key)
     })
     const taskAttempts = await runSettledInBatches(taskFactories, 6)
+    console.log('Winner Cloner v1.0.4 total create ms', Date.now() - startedAt, 'promptMode', master.mode || 'unknown')
 
     const taskIds = taskAttempts.filter((r) => r.status === 'fulfilled').map((r) => r.value)
     const failed = taskAttempts.filter((r) => r.status === 'rejected')
@@ -51,6 +55,7 @@ exports.handler = async (event) => {
       warning: failed.length ? `${failed.length} of ${requested} image tasks could not be created. The successful tasks will continue.` : undefined,
       promptSummary: master.summary || 'Prompt Master completed winner analysis and product adaptation.',
       blueprint: master.blueprint || {},
+      promptMode: master.mode || 'ai',
     })
   } catch (err) {
     console.error(err)
@@ -76,7 +81,7 @@ async function uploadDataUrl(dataUrl, filename, key) {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ base64Data: dataUrl, uploadPath: 'winner-cloner', fileName: filename }),
-  }, { timeoutMs: 8000, retries: 1 })
+  }, { timeoutMs: 7000, retries: 1 })
   if (!response.ok || data.success === false) throw new Error(`Kie file upload failed: ${data.msg || response.status}`)
   const url = data?.data?.downloadUrl || data?.data?.fileUrl
   if (!url) throw new Error('Kie upload did not return a file URL.')
@@ -84,72 +89,68 @@ async function uploadDataUrl(dataUrl, filename, key) {
 }
 
 async function runPromptMaster(ctx, key) {
-  const product = ctx.product
+  const product = ctx.product || {}
   const strength = Number(ctx.cloneStrength) || 90
   const fidelityInstruction = strength >= 90
-    ? 'Extremely close structural clone: preserve the original composition, number of copy blocks, hierarchy, relative sizing, placement, visual rhythm and persuasive sequence. Change only what must change for the new product and market.'
+    ? 'Extremely close structural clone: preserve composition, copy-block count, hierarchy, relative sizing, placement, visual rhythm and persuasive sequence. Change only what must change for the new product and market.'
     : strength >= 75
-      ? 'Close controlled clone: keep the same concept and structure, while allowing small changes in supporting visual details.'
+      ? 'Close controlled clone: keep the same concept and structure, allowing only small changes in supporting visual details.'
       : strength >= 55
         ? 'Inspired adaptation: preserve the core concept and persuasion mechanism but allow a noticeably fresh execution.'
         : 'Loose concept adaptation: use the winner mainly as strategic inspiration while maintaining recognizable concept logic.'
 
+  // Keep the hidden Prompt Master compact enough to complete inside a single
+  // Netlify synchronous request. The old v1.0.3 could chain Pro -> Pro -> Flash,
+  // making a 60s Netlify 504 mathematically possible even when every timeout
+  // behaved exactly as configured.
   const prompt = `
 You are PROMPT MASTER, an expert Meta static-ad copywriter, creative strategist and visual reverse-engineer for direct-response ecommerce.
 
-NON-NEGOTIABLE WORKFLOW:
-1) Analyze the attached WINNING AD first. Treat it as the structural source of truth.
-2) Extract its exact advertising architecture: aspect ratio, composition, headline/subheadline/body/CTA count, copy length, visual hierarchy, typography behavior, product/subject placement, badges, icons, background, photographic style, persuasive mechanism, offer presentation and trust elements.
-3) Rebuild that same high-performing concept for the PRODUCT CONTEXT below.
-4) Preserve the winner's structure and persuasive flow. Do not turn it into a generic new ad.
-5) Write market-native copy for ${ctx.market}. Output language: ${ctx.outputLanguage}.
-6) Use the product's actual information, offer, guarantee, objections and guardrails. Do not invent unsupported factual claims.
-7) The final image prompt must explicitly tell the image model that reference image #1 is the winning-ad layout/style reference and the remaining reference images are the actual product identity/packaging references.
-8) The product in the generated creative must visually match the supplied product reference images. Do not redesign the packaging unless the user explicitly asks.
-9) Keep text quantity faithful to the original winner. If the winner has only a headline and one short supporting line, do not add paragraphs, footers or extra tiny copy.
-10) Generate a finished ad creative, not a wireframe, not an explanation, not a collage of references.
+MANDATORY PROCESS:
+1. Analyze reference image #1 (the winning ad) first and treat it as the structural source of truth.
+2. Extract its composition, exact copy-block count/length, hierarchy, product/subject placement, badges/icons, background treatment, photographic/design style, persuasive mechanism, offer presentation and CTA logic.
+3. Rebuild that same concept for the selected product and target market using the real product information below.
+4. Reference images #2 onward are the actual product/packaging references. Reproduce them faithfully; do not redesign packaging, logo, colors or proportions.
+5. Keep text quantity faithful to the winner. Never add extra paragraphs, tiny footer copy, badges or icons unless the winner structurally calls for them.
+6. Write natural market-native copy for ${clip(ctx.market, 120)}. Output language: ${clip(ctx.outputLanguage, 120)}.
+7. Do not invent unsupported factual claims. Follow guardrails.
+8. Return a finished static ad concept, not a mockup, wireframe, collage or explanation.
 
 CLONE STRENGTH: ${strength}%
 ${fidelityInstruction}
 
-WINNER METADATA:
-Name: ${ctx.winner.name || ''}
-Source market: ${ctx.winner.sourceMarket || ''}
-Platform: ${ctx.winner.platform || ''}
-Ad type: ${ctx.winner.adType || ''}
-Original format: ${ctx.winner.format || ''}
-Tags: ${ctx.winner.tags || ''}
-Winner notes: ${ctx.winner.notes || ''}
+WINNER:
+Name: ${clip(ctx.winner?.name, 220)}
+Source market: ${clip(ctx.winner?.sourceMarket, 120)}
+Ad type: ${clip(ctx.winner?.adType, 120)}
+Format: ${clip(ctx.winner?.format, 60)}
+Tags/notes: ${clip(`${ctx.winner?.tags || ''} ${ctx.winner?.notes || ''}`, 1200)}
 
-PRODUCT CONTEXT:
-Product: ${product.name}
-Brand: ${product.brand || ''}
-Category: ${product.category || ''}
-One-line summary: ${product.summary || ''}
-Full explanation: ${product.description || ''}
-Mechanism / how it works: ${product.mechanism || ''}
-Benefits: ${product.benefits || ''}
-Audience / avatar: ${product.audience || ''}
-Customer objections / fears / critiques: ${product.objections || ''}
-Offer: ${product.offer || ''}
-Guarantee: ${product.guarantee || ''}
-Guardrails / forbidden claims / visual rules: ${product.guardrails || ''}
-Research & notes: ${product.notes || ''}
+PRODUCT:
+Name: ${clip(product.name, 220)}
+Brand/category: ${clip(`${product.brand || ''} / ${product.category || ''}`, 300)}
+Summary: ${clip(product.summary, 1200)}
+Explanation: ${clip(product.description, 2600)}
+Mechanism: ${clip(product.mechanism, 1800)}
+Benefits: ${clip(product.benefits, 1800)}
+Audience: ${clip(product.audience, 1200)}
+Objections: ${clip(product.objections, 1200)}
+Offer/guarantee: ${clip(`${product.offer || ''} ${product.guarantee || ''}`, 1200)}
+Guardrails: ${clip(product.guardrails, 1200)}
+Research/notes: ${clip(product.notes, 1800)}
 
-PAGE CONTEXT EXTRACTED FROM PROVIDED LINKS:
-${ctx.pageContext || 'No page text was available.'}
+PAGE CONTEXT:
+${clip(ctx.pageContext || 'No page text available.', 10000)}
 
-GENERATION SETTINGS:
-Target market: ${ctx.market}
-Output language: ${ctx.outputLanguage}
-Requested aspect ratio: ${ctx.aspectRatio}
-Extra user instructions: ${ctx.extraNotes || 'None'}
+SETTINGS:
+Target market: ${clip(ctx.market, 120)}
+Output language: ${clip(ctx.outputLanguage, 120)}
+Aspect ratio: ${ctx.aspectRatio}
+Extra instructions: ${clip(ctx.extraNotes || 'None', 1800)}
 
-FINAL PROMPT RELIABILITY RULE:
-Keep final_image_prompt complete but concise. It must stay under ${promptLimitForModel(ctx.model)} characters so the downstream image model cannot reject it for excessive prompt length. Prioritize exact ad copy, reference roles, layout, hierarchy, product fidelity and visual execution over redundant prose.
-
-Return a structured Prompt Master payload. final_image_prompt is mandatory and must be a complete production-ready image-generation prompt with the exact new ad copy to render.
-`
+OUTPUT REQUIREMENT:
+Return JSON with only summary and final_image_prompt. final_image_prompt is mandatory, production-ready, under 5200 characters, and must contain the exact adapted ad copy plus explicit reference-image roles, layout/hierarchy, product fidelity, text-density and aspect-ratio instructions.
+`.trim()
 
   const content = [
     { type: 'text', text: prompt },
@@ -157,107 +158,45 @@ Return a structured Prompt Master payload. final_image_prompt is mandatory and m
     ...ctx.productUrls.slice(0, 4).map((url) => ({ type: 'image_url', image_url: { url } })),
   ]
 
-  // Kie's current Gemini 2.5 Pro documentation uses an OpenAI-style
-  // response_format envelope with json_schema.name/strict/schema nested under
-  // response_format.json_schema. v1.0.2 accidentally put schema properties at
-  // the wrong level, which could force an unstructured fallback response.
-  const masterRequest = {
+  const request = {
     messages: [{ role: 'user', content }],
     stream: false,
-    reasoning_effort: 'high',
+    reasoning_effort: 'medium',
     response_format: promptMasterResponseFormat(),
   }
 
-  let firstError = null
-  let firstData = null
   try {
-    let { response, data } = await postPromptMaster(masterRequest, key, 26000, 'gemini-2.5-pro')
-    firstData = data
-
-    // Defensive compatibility fallback if Kie changes/temporarily rejects the
-    // optional structured-output envelope. The Prompt Master instruction still
-    // runs; we simply consume its normal assistant text instead.
-    if (!response.ok && [400, 422].includes(response.status)) {
-      const fallbackRequest = { ...masterRequest }
-      delete fallbackRequest.response_format
-      ;({ response, data } = await postPromptMaster(fallbackRequest, key, 20000, 'gemini-2.5-pro'))
-      firstData = data
-    }
-
-    if (!response.ok) {
-      firstError = new Error(`Prompt Master failed: ${data?.error?.message || data?.msg || response.status}`)
-    } else {
+    // ONE AI call maximum. 18s hard cap leaves ample room for uploads and
+    // createTask before Netlify's non-configurable 60s synchronous limit.
+    const { response, data } = await postPromptMaster(request, key, PROMPT_MASTER_TIMEOUT_MS, 'gemini-2.5-pro')
+    if (response.ok) {
       const parsed = extractPromptMasterPayload(data)
-      if (hasUsableFinalPrompt(parsed)) return normalizePromptMasterPayload(parsed)
-
-      // A 200 response can still be plain prose if the provider ignores or
-      // downgrades structured output. Preserve it for a last-resort fallback,
-      // but first retry through the faster multimodal Flash endpoint.
-      console.warn('Prompt Master Pro returned no structured final prompt', summarizeResponseShape(data))
+      if (hasUsableFinalPrompt(parsed)) {
+        return { ...normalizePromptMasterPayload(parsed), mode: 'ai' }
+      }
+      const rawText = extractAssistantText(data)
+      if (isUsablePromptText(rawText)) {
+        return {
+          ...normalizePromptMasterPayload({
+            summary: 'Prompt Master completed winner analysis and product adaptation.',
+            final_image_prompt: cleanAssistantPrompt(rawText),
+          }),
+          mode: 'ai-text',
+        }
+      }
+      console.warn('Prompt Master returned no usable prompt; using deterministic master fallback', summarizeResponseShape(data))
+    } else {
+      console.warn('Prompt Master HTTP failure; using deterministic master fallback', response.status, data?.msg || data?.error?.message || '')
     }
   } catch (err) {
-    firstError = err
-    console.warn('Prompt Master Pro request failed', cleanError(err))
+    console.warn('Prompt Master timed out/failed; using deterministic master fallback', cleanError(err))
   }
 
-  // Recovery is deliberately a different transport/model path. This avoids a
-  // second identical failure mode while keeping the exact same hidden Prompt
-  // Master instructions and winner/product image context.
-  try {
-    const recovered = await recoverPromptMaster(content, key)
-    if (hasUsableFinalPrompt(recovered)) return normalizePromptMasterPayload(recovered)
-  } catch (err) {
-    console.warn('Prompt Master Flash recovery failed', cleanError(err))
-  }
-
-  // If Pro returned substantial assistant text that merely failed JSON
-  // parsing, that text is still Prompt Master output and is safe to use as the
-  // downstream production prompt instead of failing the whole job.
-  const rawProText = extractAssistantText(firstData)
-  if (isUsablePromptText(rawProText)) {
-    return normalizePromptMasterPayload({
-      summary: 'Prompt Master completed winner analysis and product adaptation (plain-text fallback).',
-      blueprint: {},
-      final_image_prompt: cleanAssistantPrompt(rawProText),
-      variations: [],
-    })
-  }
-
-  // Final non-fatal safety net. This keeps the Prompt Master rules embedded in
-  // the image-generation prompt even if Kie's chat endpoints are temporarily
-  // returning empty/malformed bodies. It avoids the old "incomplete prompt"
-  // hard failure and still passes the winner + product reference images to the
-  // selected image model.
-  console.warn('Using deterministic Prompt Master safety prompt', firstError ? cleanError(firstError) : 'empty provider output')
-  return buildDeterministicPromptMasterFallback(ctx, strength, fidelityInstruction)
-}
-
-async function recoverPromptMaster(originalContent, key) {
-  const recoveryInstruction = {
-    type: 'text',
-    text: `RECOVERY MODE: Run the same Prompt Master analysis and return one complete production-ready image-generation prompt as PLAIN TEXT only. Do not return JSON, markdown fences, headings about your process, or an explanation. The prompt must include: exact adapted ad copy, winner-reference role, product-reference roles, layout/hierarchy, product fidelity, target-market adaptation, text-density limits, and aspect-ratio requirement.`,
-  }
-
-  const recoveryRequest = {
-    messages: [{ role: 'user', content: [...originalContent, recoveryInstruction] }],
-    stream: false,
-    reasoning_effort: 'medium',
-  }
-
-  const { response, data } = await postPromptMaster(recoveryRequest, key, 15000, 'gemini-2.5-flash')
-  if (!response.ok) throw new Error(`Prompt Master recovery failed: ${data?.error?.message || data?.msg || response.status}`)
-
-  const parsed = extractPromptMasterPayload(data)
-  if (hasUsableFinalPrompt(parsed)) return parsed
-
-  const text = cleanAssistantPrompt(extractAssistantText(data))
-  if (!isUsablePromptText(text)) return null
-  return {
-    summary: 'Prompt Master completed winner analysis and product adaptation via recovery mode.',
-    blueprint: {},
-    final_image_prompt: text,
-    variations: [],
-  }
+  // This is not "Prompt Master off". The exact same mandatory Prompt Master
+  // rules are compiled into the downstream image-model prompt, and the winner
+  // + product references are still supplied to the image model. It exists only
+  // to make provider latency non-fatal.
+  return { ...buildDeterministicPromptMasterFallback(ctx, strength, fidelityInstruction), mode: 'deterministic-fallback' }
 }
 
 function promptMasterResponseFormat() {
@@ -271,32 +210,9 @@ function promptMasterResponseFormat() {
         additionalProperties: false,
         properties: {
           summary: { type: 'string' },
-          blueprint: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              layout: { type: 'string' },
-              copy_structure: { type: 'string' },
-              visual_style: { type: 'string' },
-              persuasion_mechanism: { type: 'string' },
-              product_placement: { type: 'string' },
-              trust_elements: { type: 'string' },
-              text_density: { type: 'string' },
-            },
-            required: ['layout', 'copy_structure', 'visual_style', 'persuasion_mechanism', 'product_placement', 'trust_elements', 'text_density'],
-          },
           final_image_prompt: { type: 'string' },
-          variations: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: { instruction: { type: 'string' } },
-              required: ['instruction'],
-            },
-          },
         },
-        required: ['summary', 'blueprint', 'final_image_prompt', 'variations'],
+        required: ['summary', 'final_image_prompt'],
       },
     },
   }
@@ -374,7 +290,7 @@ async function createImageTask(model, prompt, refs, aspectRatio, key) {
     input = { prompt, image_input: refs.slice(0, 6), aspect_ratio: aspectRatio, resolution: '1K', output_format: 'png' }
   } else if (effectiveModel === 'gpt-image-2-image-to-image') {
     input = { prompt, input_urls: refs.slice(0, 5), aspect_ratio: aspectRatio }
-  } else if (effectiveModel === 'grok-imagine-image-2-0/image-edit') {
+  } else if (effectiveModel === 'grok-imagine-image-2-0/image-to-image') {
     input = { prompt, image_urls: refs.slice(0, 5), aspect_ratio: aspectRatio }
   } else {
     throw new Error(`Unsupported image model: ${model}`)
@@ -384,7 +300,7 @@ async function createImageTask(model, prompt, refs, aspectRatio, key) {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: effectiveModel, input }),
-  }, { timeoutMs: 8000, retries: 0 })
+  }, { timeoutMs: 7000, retries: 0 })
   if (!response.ok || (data.code && Number(data.code) !== 200)) throw new Error(`Image task failed: ${data.msg || response.status}`)
   const id = data?.data?.taskId
   if (!id) throw new Error('Image task did not return a taskId.')
@@ -397,12 +313,12 @@ async function collectPageContext(links) {
   const chunks = await Promise.all(entries.slice(0, 4).map(async ([label, url]) => {
     try {
       const text = await fetchSafePage(String(url))
-      return `\n--- ${label.toUpperCase()} ---\n${text.slice(0, 10000)}`
+      return `\n--- ${label.toUpperCase()} ---\n${text.slice(0, 4500)}`
     } catch (e) {
       return `\n--- ${label.toUpperCase()} ---\n[Could not fetch this page: ${cleanError(e)}]`
     }
   }))
-  return chunks.join('\n').slice(0, 28000)
+  return chunks.join('\n').slice(0, 10000)
 }
 
 async function fetchSafePage(rawUrl) {
@@ -412,13 +328,13 @@ async function fetchSafePage(rawUrl) {
   if (host === 'localhost' || host.endsWith('.local')) throw new Error('Local addresses are blocked')
   if (net.isIP(host) && isPrivateIp(host)) throw new Error('Private network addresses are blocked')
   if (!net.isIP(host)) {
-    const resolved = await dns.lookup(host, { all: true })
+    const resolved = await withTimeout(dns.lookup(host, { all: true }), 1800, 'DNS lookup timed out')
     if (resolved.some((r) => isPrivateIp(r.address))) throw new Error('Private network addresses are blocked')
   }
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 7000)
+  const timer = setTimeout(() => controller.abort(), 4000)
   try {
-    const response = await fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'User-Agent': 'WinnerCloner/1.0.3' } })
+    const response = await fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'User-Agent': 'WinnerCloner/1.0.4' } })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const contentType = response.headers.get('content-type') || ''
     if (!contentType.includes('text/html') && !contentType.includes('text/plain')) throw new Error('Page is not text/HTML')
@@ -633,11 +549,11 @@ function parseJson(text) {
 }
 
 function normalizeImageModel(model) {
-  return model === 'grok-imagine-image-2-0/image-to-image' ? 'grok-imagine-image-2-0/image-edit' : model
+  return model === 'grok-imagine-image-2-0/image-edit' ? 'grok-imagine-image-2-0/image-to-image' : model
 }
 
 function promptLimitForModel(model) {
-  return normalizeImageModel(model) === 'grok-imagine-image-2-0/image-edit' ? 4200 : 7500
+  return normalizeImageModel(model) === 'grok-imagine-image-2-0/image-to-image' ? 4200 : 7500
 }
 
 function fitPromptForModel(prompt, model) {
@@ -683,6 +599,18 @@ async function runSettledInBatches(factories, batchSize) {
     out.push(...await Promise.allSettled(factories.slice(i, i + batchSize).map((fn) => fn())))
   }
   return out
+}
+
+function clip(value, max) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (text.length <= max) return text
+  return `${text.slice(0, Math.max(0, max - 24))} …[context clipped]`
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs) })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)) }

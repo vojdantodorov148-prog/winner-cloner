@@ -1,26 +1,17 @@
-# DEPLOY NOW — Winner Cloner
+# Deploy v1.0.4 to the existing Netlify site
 
-## Fastest route: GitHub → Netlify
+## Fastest fix (recommended for the current Nano Banana workflow)
 
-1. Unzip this project.
-2. Create a new **private** GitHub repository named `winner-cloner`.
-3. Upload **all files and folders inside the project** to the repository root.
-4. In Netlify choose **Add new site → Import an existing project → GitHub → winner-cloner**.
-5. Netlify should detect:
-   - Build command: `npm run build`
-   - Publish directory: `dist`
-   - Functions directory: `netlify/functions`
-6. Deploy once.
-7. Go to **Site configuration → Environment variables** and add:
-   - `KIE_API_KEY` = your private Kie.ai key
-8. Go to **Deploys → Trigger deploy → Deploy site**.
-9. Open the site:
-   - Winners → upload a winner
-   - Products → create product + add product photo
-   - Generate → select both → Generate
+Replace only:
 
-Do not place the Kie API key in GitHub or in the browser settings.
+`netlify/functions/generate.js`
 
-## Updating an existing Winner Cloner site to v1.0.3
+with the v1.0.4 version, commit to GitHub, and let Netlify redeploy.
 
-Because this reliability update changes frontend code and all Netlify Functions, replace/update the whole repository contents rather than only `generate.js`. Keep the same Netlify site and domain. Your existing browser-local Winners and Products remain on that same site origin. The existing `KIE_API_KEY` Netlify environment variable does not need to be entered again.
+This fixes the 504 runtime chain immediately and does not change browser-stored products/winners.
+
+## Full update
+
+Replace the repository contents with v1.0.4 and commit. This also fixes the Grok Imagine model identifier in the frontend and local-state migration.
+
+Your existing `KIE_API_KEY` environment variable remains configured in Netlify and does not need to be entered again.

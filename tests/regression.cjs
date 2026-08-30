@@ -1,6 +1,7 @@
 const assert = require('assert')
 
 process.env.KIE_API_KEY = 'test-key'
+process.env.PROMPT_MASTER_TIMEOUT_MS = '80'
 
 function jsonResponse(obj, status = 200, headers = {}) {
   return new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json', ...headers } })
@@ -38,9 +39,7 @@ async function testGenerateArrayContentAndTaskCreation() {
       assert.ok(req.response_format?.json_schema?.schema?.properties?.final_image_prompt)
       const payload = {
         summary: 'ok',
-        blueprint: { layout: 'same', copy_structure: '', visual_style: '', persuasion_mechanism: '', product_placement: '', trust_elements: '', text_density: '' },
         final_image_prompt: 'A'.repeat(9000),
-        variations: [{ instruction: 'v1' }, { instruction: 'v2' }],
       }
       return jsonResponse({ choices: [{ message: { content: [{ type: 'text', text: JSON.stringify(payload) }] }, finish_reason: 'stop' }] })
     }
@@ -60,33 +59,37 @@ async function testGenerateArrayContentAndTaskCreation() {
   assert.ok(sawPromptLength <= 7500, `prompt was not compacted: ${sawPromptLength}`)
 }
 
-async function testGenerateRecovery() {
+async function testMalformedPromptMasterFallsBackWithoutSecondAiCall() {
   delete require.cache[require.resolve('../netlify/functions/generate.js')]
   const generate = require('../netlify/functions/generate.js')
   let proCalls = 0
   let flashCalls = 0
-  global.fetch = async (url) => {
+  let createBody
+  global.fetch = async (url, opts = {}) => {
     const u = String(url)
     if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
     if (u.includes('gemini-2.5-pro')) {
       proCalls++
       return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'missing prompt' }) } }] })
     }
-    if (u.includes('gemini-2.5-flash')) {
-      flashCalls++
-      return jsonResponse({ choices: [{ message: { content: 'Create a finished 4:5 static ad that preserves the winner layout exactly, uses the supplied product packaging reference faithfully, and renders concise market-native copy with the same hierarchy and text density.' } }] })
+    if (u.includes('gemini-2.5-flash')) { flashCalls++; throw new Error('Flash must not be called in v1.0.4') }
+    if (u.includes('/api/v1/jobs/createTask')) {
+      createBody = JSON.parse(opts.body)
+      return jsonResponse({ code: 200, data: { taskId: 'task-fallback' } })
     }
-    if (u.includes('/api/v1/jobs/createTask')) return jsonResponse({ code: 200, data: { taskId: 'task-recovered' } })
     throw new Error(`Unexpected fetch ${u}`)
   }
   const out = await generate.handler({ httpMethod: 'POST', body: JSON.stringify(basePayload({ variations: 1 })) })
   assert.equal(out.statusCode, 200, out.body)
   assert.equal(proCalls, 1)
-  assert.equal(flashCalls, 1)
-  assert.deepEqual(JSON.parse(out.body).taskIds, ['task-recovered'])
+  assert.equal(flashCalls, 0)
+  const body = JSON.parse(out.body)
+  assert.equal(body.promptMode, 'deterministic-fallback')
+  assert.deepEqual(body.taskIds, ['task-fallback'])
+  assert.ok(createBody.input.prompt.includes('PROMPT MASTER'))
 }
 
-async function testPromptMasterSchemaFallback() {
+async function testPromptMasterSchemaRejectionFallsBackImmediately() {
   delete require.cache[require.resolve('../netlify/functions/generate.js')]
   const generate = require('../netlify/functions/generate.js')
   let geminiCalls = 0
@@ -96,20 +99,18 @@ async function testPromptMasterSchemaFallback() {
     if (u.includes('gemini-2.5-pro')) {
       geminiCalls++
       const body = JSON.parse(opts.body)
-      if (geminiCalls === 1) {
-        assert.ok(body.response_format)
-        return jsonResponse({ msg: 'unsupported response_format envelope' }, 400)
-      }
-      assert.equal(body.response_format, undefined)
-      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'fallback ok', blueprint: {}, final_image_prompt: 'Create a finished static ad that preserves the winner layout, hierarchy, product placement, text density and product fidelity while adapting the copy for the selected market.', variations: [] }) } }] })
+      assert.ok(body.response_format)
+      return jsonResponse({ msg: 'provider rejected request' }, 400)
     }
     if (u.includes('/api/v1/jobs/createTask')) return jsonResponse({ code: 200, data: { taskId: 'task-schema-fallback' } })
     throw new Error(`Unexpected fetch ${u}`)
   }
   const out = await generate.handler({ httpMethod: 'POST', body: JSON.stringify(basePayload({ variations: 1 })) })
   assert.equal(out.statusCode, 200, out.body)
-  assert.equal(geminiCalls, 2)
-  assert.deepEqual(JSON.parse(out.body).taskIds, ['task-schema-fallback'])
+  assert.equal(geminiCalls, 1)
+  const body = JSON.parse(out.body)
+  assert.equal(body.promptMode, 'deterministic-fallback')
+  assert.deepEqual(body.taskIds, ['task-schema-fallback'])
 }
 
 async function testDeterministicPromptMasterSafetyFallback() {
@@ -120,7 +121,6 @@ async function testDeterministicPromptMasterSafetyFallback() {
     const u = String(url)
     if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
     if (u.includes('gemini-2.5-pro')) return jsonResponse({ choices: [{ message: { content: '' } }] })
-    if (u.includes('gemini-2.5-flash')) return jsonResponse({ choices: [{ message: { content: '' } }] })
     if (u.includes('/api/v1/jobs/createTask')) {
       createBody = JSON.parse(opts.body)
       return jsonResponse({ code: 200, data: { taskId: 'task-safety' } })
@@ -132,6 +132,33 @@ async function testDeterministicPromptMasterSafetyFallback() {
   assert.deepEqual(JSON.parse(out.body).taskIds, ['task-safety'])
   assert.ok(createBody.input.prompt.includes('PROMPT MASTER'))
   assert.ok(createBody.input.prompt.includes('Reference image #1'))
+}
+
+async function testPromptMasterTimeoutFallsBackWithinBudget() {
+  delete require.cache[require.resolve('../netlify/functions/generate.js')]
+  const generate = require('../netlify/functions/generate.js')
+  let proCalls = 0
+  global.fetch = async (url, opts = {}) => {
+    const u = String(url)
+    if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
+    if (u.includes('gemini-2.5-pro')) {
+      proCalls++
+      return await new Promise((resolve, reject) => {
+        const signal = opts.signal
+        if (signal?.aborted) return reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+        signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })
+      })
+    }
+    if (u.includes('/api/v1/jobs/createTask')) return jsonResponse({ code: 200, data: { taskId: 'task-after-timeout' } })
+    throw new Error(`Unexpected fetch ${u}`)
+  }
+  const started = Date.now()
+  const out = await generate.handler({ httpMethod: 'POST', body: JSON.stringify(basePayload({ variations: 1 })) })
+  const elapsed = Date.now() - started
+  assert.equal(out.statusCode, 200, out.body)
+  assert.equal(proCalls, 1)
+  assert.equal(JSON.parse(out.body).promptMode, 'deterministic-fallback')
+  assert.ok(elapsed < 1000, `test timeout fallback took too long: ${elapsed}ms`)
 }
 
 async function testPartialTaskCreationStillReturnsSuccess() {
@@ -226,9 +253,9 @@ async function testAllModelRequestShapesAndGrokMigration() {
     ['nano-banana-pro', 'nano-banana-pro', 'image_input'],
     ['nano-banana-2', 'nano-banana-2', 'image_input'],
     ['gpt-image-2-image-to-image', 'gpt-image-2-image-to-image', 'input_urls'],
-    ['grok-imagine-image-2-0/image-edit', 'grok-imagine-image-2-0/image-edit', 'image_urls'],
-    // Existing users may have the old ID saved; server must migrate it.
-    ['grok-imagine-image-2-0/image-to-image', 'grok-imagine-image-2-0/image-edit', 'image_urls'],
+    ['grok-imagine-image-2-0/image-to-image', 'grok-imagine-image-2-0/image-to-image', 'image_urls'],
+    // v1.0.3 accidentally saved image-edit; server must migrate it.
+    ['grok-imagine-image-2-0/image-edit', 'grok-imagine-image-2-0/image-to-image', 'image_urls'],
   ]
 
   for (const [requestedModel, expectedModel, refKey] of cases) {
@@ -256,9 +283,10 @@ async function testAllModelRequestShapesAndGrokMigration() {
 async function main() {
   const tests = [
     testGenerateArrayContentAndTaskCreation,
-    testGenerateRecovery,
-    testPromptMasterSchemaFallback,
+    testMalformedPromptMasterFallsBackWithoutSecondAiCall,
+    testPromptMasterSchemaRejectionFallsBackImmediately,
     testDeterministicPromptMasterSafetyFallback,
+    testPromptMasterTimeoutFallsBackWithinBudget,
     testPartialTaskCreationStillReturnsSuccess,
     testStatusNeverReturnsInputReference,
     testStatusSuccessWithoutUrlKeepsPolling,

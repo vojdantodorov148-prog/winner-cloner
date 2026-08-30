@@ -25,9 +25,9 @@ export function loadState(): AppState {
     if (!raw) return defaultState
     const parsed = JSON.parse(raw) as AppState
     const defaults = { ...defaultState.defaults, ...(parsed.defaults || {}) }
-    // Kie's current Grok Imagine 2.0 reference-image model is image-edit.
-    // Migrate the older image-to-image identifier retained by previous builds.
-    if (defaults.model === 'grok-imagine-image-2-0/image-to-image') defaults.model = 'grok-imagine-image-2-0/image-edit'
+    // Kie's current reference-image endpoint is image-to-image.
+    // Migrate the broken v1.0.3 image-edit identifier retained by previous builds.
+    if (defaults.model === 'grok-imagine-image-2-0/image-edit') defaults.model = 'grok-imagine-image-2-0/image-to-image'
     return {
       ...defaultState,
       ...parsed,
