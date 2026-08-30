@@ -20,3 +20,7 @@
    - Generate → select both → Generate
 
 Do not place the Kie API key in GitHub or in the browser settings.
+
+## Updating an existing Winner Cloner site to v1.0.2
+
+Because this reliability update changes frontend code and all Netlify Functions, replace/update the whole repository contents rather than only `generate.js`. Keep the same Netlify site and domain. Your existing browser-local Winners and Products remain on that same site origin. The existing `KIE_API_KEY` Netlify environment variable does not need to be entered again.

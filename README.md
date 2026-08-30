@@ -12,7 +12,7 @@ A deployable React + Netlify Functions app for cloning high-performing static ad
 - Results/jobs history in browser localStorage
 - Kie.ai server-side integration through Netlify Functions
 - Prompt Master: Gemini 2.5 Pro multimodal through Kie.ai
-- Image models: Nano Banana Pro, Nano Banana 2, GPT Image 2 image-to-image, Grok Imagine Image 2.0 image-to-image
+- Image models: Nano Banana Pro, Nano Banana 2, GPT Image 2 image-to-image, Grok Imagine Image 2.0 image edit/reference mode
 - Polling for Kie job completion
 - Working server-side image download proxy
 - Kie credit check in Settings
@@ -93,3 +93,25 @@ The app stores product/winner data in the current browser. Clearing browser site
 - No Kie key is written to localStorage
 - Product page URL fetching blocks localhost/private-network targets
 - Download proxy only accepts Kie-related asset hosts
+
+## v1.0.2 reliability audit
+
+This build includes a full generation-pipeline hardening pass:
+
+- Prompt Master structured-response parser + automatic recovery remains always ON.
+- Kie status parsing reads generated URLs from `resultJson` only, so an input/winner reference URL cannot be mistaken for the finished creative.
+- A Kie `success` state without a result URL continues polling instead of completing a blank result.
+- Unfinished jobs resume polling after page refresh/reopen.
+- Polling uses backoff and a 15-minute timeout with explicit result errors.
+- Kie calls use request timeouts and retries for transient provider/network errors.
+- Image task creation tolerates partial task failures instead of discarding successful tasks.
+- Prompt length is capped per model before task creation.
+- Uploaded browser images are resized/compressed to reduce oversized Netlify request failures.
+- Winner/product asset replacement no longer deletes the previous saved image before Save, so Cancel cannot break an existing library item.
+- Grok Imagine 2.0 uses Kie’s current reference-image `grok-imagine-image-2-0/image-edit` model ID with `image_urls`; saved older `image-to-image` IDs are migrated automatically.
+- Downloads use Kie’s authenticated generated-file download-link API.
+- Top-level package versions are pinned for more repeatable Netlify builds.
+- Regression suite covers Prompt Master response variants/recovery/schema fallback, partial image-task creation, result URL parsing, no-URL success states, model request shapes/migration, credits and downloads.
+
+
+See `AUDIT-REPORT.md` for the v1.0.2 reliability audit and verification limitations.

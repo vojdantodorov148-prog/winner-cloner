@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   Boxes,
   Check,
@@ -33,7 +33,7 @@ import AssetThumb from './components/AssetThumb'
 import Dropzone from './components/Dropzone'
 import Modal from './components/Modal'
 import { createGeneration, downloadProxyUrl, getCredits, getTaskStatus } from './lib/api'
-import { deleteAsset, getAsset, loadState, saveAsset, saveDataUrlAsset, saveState } from './lib/db'
+import { deleteAsset, getAsset, loadState, optimizeDataUrl, saveAsset, saveState } from './lib/db'
 import type { AppState, Job, NavKey, Product, Winner } from './types'
 
 const markets = ['Croatia', 'Greece', 'Hungary', 'Bulgaria', 'Romania', 'Germany', 'United Kingdom', 'United States', 'North Macedonia', 'Custom']
@@ -41,7 +41,7 @@ const models = [
   { value: 'nano-banana-pro', label: 'Nano Banana Pro', note: 'Recommended · strongest reference fidelity' },
   { value: 'nano-banana-2', label: 'Nano Banana 2', note: 'Faster Google option' },
   { value: 'gpt-image-2-image-to-image', label: 'GPT Image 2', note: 'Strong text + composition' },
-  { value: 'grok-imagine-image-2-0/image-to-image', label: 'Grok Imagine 2.0', note: 'Alternative visual interpretation' },
+  { value: 'grok-imagine-image-2-0/image-edit', label: 'Grok Imagine 2.0', note: 'Alternative visual interpretation' },
 ]
 
 const emptyProduct = (): Product => ({
@@ -97,8 +97,21 @@ function App() {
   const [toast, setToast] = useState('')
   const [credits, setCredits] = useState<number | null>(null)
   const [detailsJob, setDetailsJob] = useState<Job | null>(null)
+  const pollingJobs = useRef(new Set<string>())
 
   useEffect(() => saveState(state), [state])
+  useEffect(() => {
+    // Resume unfinished generations after a refresh/reopen instead of leaving
+    // them permanently stuck in the Generating state.
+    for (const job of state.jobs) {
+      if (job.status !== 'generating') continue
+      const taskIds = job.results.filter((r) => r.taskId && r.status !== 'success' && r.status !== 'fail').map((r) => r.taskId)
+      if (taskIds.length) void pollJob(job.id, taskIds)
+    }
+    // Only resume the state that existed when the app loaded. New jobs call
+    // pollJob directly from generate().
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   useEffect(() => {
     if (!selectedProductId && state.products[0]) setSelectedProductId(state.products[0].id)
     if (!selectedWinnerId && state.winners[0]) setSelectedWinnerId(state.winners[0].id)
@@ -134,10 +147,13 @@ function App() {
   const persistProduct = (product: Product) => {
     const now = new Date().toISOString()
     const updated = { ...product, updatedAt: now }
+    const previous = state.products.find((p) => p.id === updated.id)
+    const removedAssets = previous?.assetIds.filter((id) => !updated.assetIds.includes(id)) || []
     setState((s) => {
       const exists = s.products.some((p) => p.id === updated.id)
       return { ...s, products: exists ? s.products.map((p) => p.id === updated.id ? updated : p) : [updated, ...s.products] }
     })
+    for (const id of removedAssets) void deleteAsset(id).catch(() => {})
     setSelectedProductId(updated.id)
     setProductEditor(null)
   }
@@ -145,11 +161,32 @@ function App() {
   const persistWinner = (winner: Winner) => {
     const now = new Date().toISOString()
     const updated = { ...winner, updatedAt: now }
+    const previous = state.winners.find((w) => w.id === updated.id)
     setState((s) => {
       const exists = s.winners.some((w) => w.id === updated.id)
       return { ...s, winners: exists ? s.winners.map((w) => w.id === updated.id ? updated : w) : [updated, ...s.winners] }
     })
+    if (previous?.assetId && previous.assetId !== updated.assetId) void deleteAsset(previous.assetId).catch(() => {})
     setSelectedWinnerId(updated.id)
+    setWinnerEditor(null)
+  }
+
+  const closeProductEditor = () => {
+    if (productEditor) {
+      const saved = state.products.find((p) => p.id === productEditor.id)
+      const savedIds = new Set(saved?.assetIds || [])
+      for (const id of productEditor.assetIds) {
+        if (!savedIds.has(id)) void deleteAsset(id).catch(() => {})
+      }
+    }
+    setProductEditor(null)
+  }
+
+  const closeWinnerEditor = () => {
+    if (winnerEditor) {
+      const saved = state.winners.find((w) => w.id === winnerEditor.id)
+      if (winnerEditor.assetId && winnerEditor.assetId !== saved?.assetId) void deleteAsset(winnerEditor.assetId).catch(() => {})
+    }
     setWinnerEditor(null)
   }
 
@@ -218,11 +255,16 @@ function App() {
     setGenerating(true)
 
     try {
+      const optimizedImages = await Promise.all([
+        optimizeDataUrl(winnerAsset.dataUrl),
+        ...productAssets.map((a) => optimizeDataUrl(a!.dataUrl)),
+      ]) as string[]
+      const [winnerImage, ...productImages] = optimizedImages
       const response = await createGeneration({
         winner: selectedWinner,
-        winnerImage: winnerAsset.dataUrl,
+        winnerImage,
         product: selectedProduct,
-        productImages: productAssets.map((a) => a!.dataUrl),
+        productImages,
         market,
         outputLanguage,
         aspectRatio,
@@ -236,6 +278,10 @@ function App() {
         ...s,
         jobs: s.jobs.map((j) => j.id === id ? { ...j, status: 'generating', results, blueprint: response.blueprint, promptSummary: response.promptSummary, updatedAt: new Date().toISOString() } : j),
       }))
+      if (response.warning) {
+        setToast(response.warning)
+        setTimeout(() => setToast(''), 5000)
+      }
       setNav('results')
       await pollJob(id, response.taskIds)
     } catch (err) {
@@ -248,37 +294,66 @@ function App() {
     }
   }
 
-  const pollJob = async (jobId: string, taskIds: string[]) => {
-    const deadline = Date.now() + 12 * 60 * 1000
+  async function pollJob(jobId: string, taskIds: string[]) {
+    if (pollingJobs.current.has(jobId)) return
+    pollingJobs.current.add(jobId)
+    const deadline = Date.now() + 15 * 60 * 1000
     const pending = new Set(taskIds)
-    while (pending.size && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 3500))
-      await Promise.all(Array.from(pending).map(async (taskId) => {
-        try {
-          const info = await getTaskStatus(taskId)
-          setState((s) => ({
-            ...s,
-            jobs: s.jobs.map((job) => job.id !== jobId ? job : {
-              ...job,
-              results: job.results.map((result) => result.taskId === taskId ? { ...result, status: info.status, imageUrl: info.imageUrl, error: info.error } : result),
-              updatedAt: new Date().toISOString(),
-            }),
-          }))
-          if (info.status === 'success' || info.status === 'fail') pending.delete(taskId)
-        } catch {
-          // Keep polling transient errors.
-        }
+    let delay = 3000
+
+    try {
+      while (pending.size && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, delay))
+        await Promise.all(Array.from(pending).map(async (taskId) => {
+          try {
+            const info = await getTaskStatus(taskId)
+            setState((s) => ({
+              ...s,
+              jobs: s.jobs.map((job) => job.id !== jobId ? job : {
+                ...job,
+                results: job.results.map((result) => result.taskId === taskId ? {
+                  ...result,
+                  status: info.status,
+                  imageUrl: info.imageUrl || result.imageUrl,
+                  error: info.error,
+                } : result),
+                updatedAt: new Date().toISOString(),
+              }),
+            }))
+            if ((info.status === 'success' && info.imageUrl) || info.status === 'fail') pending.delete(taskId)
+          } catch {
+            // Network/429/5xx status checks are transient. The server and
+            // client both retry; keep the task pending instead of failing it.
+          }
+        }))
+        delay = Math.min(10_000, Math.round(delay * 1.35))
+      }
+
+      if (pending.size) {
+        const timeoutMessage = 'Generation status timed out after 15 minutes. The Kie task may still exist; use Generate again if no result appears.'
+        setState((s) => ({
+          ...s,
+          jobs: s.jobs.map((job) => job.id !== jobId ? job : {
+            ...job,
+            results: job.results.map((result) => pending.has(result.taskId) ? { ...result, status: 'fail', error: timeoutMessage } : result),
+            updatedAt: new Date().toISOString(),
+          }),
+        }))
+      }
+
+      setState((s) => ({
+        ...s,
+        jobs: s.jobs.map((job) => {
+          if (job.id !== jobId) return job
+          const normalizedResults = job.results.map((r) => pending.has(r.taskId) && r.status !== 'success' ? { ...r, status: 'fail' as const, error: r.error || 'Generation timed out.' } : r)
+          const anySuccess = normalizedResults.some((r) => r.status === 'success' && r.imageUrl)
+          const allDone = normalizedResults.every((r) => r.status === 'success' || r.status === 'fail')
+          return { ...job, results: normalizedResults, status: allDone && anySuccess ? 'completed' : 'failed', updatedAt: new Date().toISOString() }
+        }),
       }))
+    } finally {
+      pollingJobs.current.delete(jobId)
     }
-    setState((s) => ({
-      ...s,
-      jobs: s.jobs.map((job) => {
-        if (job.id !== jobId) return job
-        const anySuccess = job.results.some((r) => r.status === 'success')
-        const allDone = job.results.every((r) => r.status === 'success' || r.status === 'fail')
-        return { ...job, status: allDone && anySuccess ? 'completed' : allDone ? 'failed' : 'failed', updatedAt: new Date().toISOString() }
-      }),
-    }))
   }
 
   const regenerateFromJob = (job: Job) => {
@@ -287,7 +362,7 @@ function App() {
     setMarket(job.market)
     setOutputLanguage(job.outputLanguage)
     setAspectRatio(job.aspectRatio)
-    setModel(job.model)
+    setModel(job.model === 'grok-imagine-image-2-0/image-to-image' ? 'grok-imagine-image-2-0/image-edit' : job.model)
     setVariations(job.variations)
     setCloneStrength(job.cloneStrength)
     setExtraNotes(job.extraNotes)
@@ -416,8 +491,8 @@ function App() {
         )}
       </main>
 
-      <ProductEditor product={productEditor} setProduct={setProductEditor} onClose={() => setProductEditor(null)} onSave={persistProduct} />
-      <WinnerEditor winner={winnerEditor} setWinner={setWinnerEditor} onClose={() => setWinnerEditor(null)} onSave={persistWinner} />
+      <ProductEditor product={productEditor} setProduct={setProductEditor} onClose={closeProductEditor} onSave={persistProduct} />
+      <WinnerEditor winner={winnerEditor} setWinner={setWinnerEditor} onClose={closeWinnerEditor} onSave={persistWinner} />
       <JobDetails job={detailsJob} winner={detailsJob ? state.winners.find((w) => w.id === detailsJob.winnerId) : undefined} product={detailsJob ? state.products.find((p) => p.id === detailsJob.productId) : undefined} onClose={() => setDetailsJob(null)} />
 
       {toast && <div className="toast">{toast}</div>}
@@ -689,8 +764,7 @@ function ProductEditor({ product, setProduct, onClose, onSave }: { product: Prod
     for (const file of files.slice(0, Math.max(0, 8 - product.assetIds.length))) saved.push(await saveAsset(file))
     update('assetIds', [...product.assetIds, ...saved.map((a) => a.id)])
   }
-  const removeAsset = async (id: string) => {
-    await deleteAsset(id).catch(() => {})
+  const removeAsset = (id: string) => {
     update('assetIds', product.assetIds.filter((x) => x !== id))
   }
   return (
@@ -714,10 +788,12 @@ function WinnerEditor({ winner, setWinner, onClose, onSave }: { winner: Winner |
   const upload = async (files: File[]) => {
     const file = files[0]
     if (!file) return
-    if (winner.assetId) await deleteAsset(winner.assetId).catch(() => {})
     const asset = await saveAsset(file)
-    update('assetId', asset.id)
-    if (!winner.name) update('name', file.name.replace(/\.[^.]+$/, ''))
+    setWinner({
+      ...winner,
+      assetId: asset.id,
+      name: winner.name || file.name.replace(/\.[^.]+$/, ''),
+    })
   }
   return (
     <Modal open title={winner.name || 'New winner'} onClose={onClose}>
