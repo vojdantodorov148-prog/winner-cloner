@@ -1,10 +1,5 @@
-# Winner Cloner v1.0.6 audit
+# v1.0.7 audit
 
-- Frontend TS/TSX syntax transpile: PASS for all source files.
-- Netlify Functions JS syntax: PASS for generate, status, download, credits, asset.
-- Existing backend regression suite: 12/12 PASS.
-- New asset proxy mock test: PASS.
-- ZIP writer verified with `unzip -t`: PASS.
-- Generation backend / Prompt Master logic from v1.0.6 was not changed.
+Root cause corrected: previous retry logic only handled createTask failures. The observed error can arrive later from Kie's task-status `failMsg`, after a valid task ID was already returned. v1.0.7 classifies that async failure as retryable and automatically creates a replacement task up to two times.
 
-Note: a full `npm install` could not complete in the sandbox network environment, so the dependency-resolved Vite build will run on Netlify as before. No new npm dependencies were added.
+Additional hardening: MIME-correct upload filenames, direct file URL preference, conservative Nano Banana prompt length, and regression coverage for retryable async provider failures.

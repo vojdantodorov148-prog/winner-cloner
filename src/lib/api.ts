@@ -40,6 +40,7 @@ export async function getTaskStatus(taskId: string) {
     imageUrl?: string
     error?: string
     progress?: number
+    retryable?: boolean
   }
 }
 

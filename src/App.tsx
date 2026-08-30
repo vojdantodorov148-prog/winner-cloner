@@ -98,8 +98,12 @@ function App() {
   const [toast, setToast] = useState('')
   const [credits, setCredits] = useState<number | null>(null)
   const pollingJobs = useRef(new Set<string>())
+  const stateRef = useRef(state)
 
-  useEffect(() => saveState(state), [state])
+  useEffect(() => {
+    stateRef.current = state
+    saveState(state)
+  }, [state])
   useEffect(() => {
     // Resume unfinished generations after a refresh/reopen instead of leaving
     // them permanently stuck in the Generating state.
@@ -273,7 +277,7 @@ function App() {
         cloneStrength,
         extraNotes,
       })
-      const results = response.taskIds.map((taskId, idx) => ({ taskId, variation: idx + 1, status: 'waiting' as const }))
+      const results = response.taskIds.map((taskId, idx) => ({ taskId, variation: idx + 1, status: 'waiting' as const, retryCount: 0, modelUsed: model }))
       setState((s) => ({
         ...s,
         jobs: s.jobs.map((j) => j.id === id ? { ...j, status: 'generating', results, blueprint: response.blueprint, promptSummary: response.promptSummary, updatedAt: new Date().toISOString() } : j),
@@ -306,6 +310,39 @@ function App() {
         await Promise.all(Array.from(pending).map(async (taskId) => {
           try {
             const info = await getTaskStatus(taskId)
+            const snapshot = stateRef.current
+            const currentJob = snapshot.jobs.find((job) => job.id === jobId)
+            const currentResult = currentJob?.results.find((result) => result.taskId === taskId)
+            const retries = currentResult?.retryCount || 0
+
+            if (info.status === 'fail' && info.retryable && retries < 2) {
+              pending.delete(taskId)
+              setState((s) => ({
+                ...s,
+                jobs: s.jobs.map((job) => job.id !== jobId ? job : {
+                  ...job,
+                  results: job.results.map((result) => result.taskId === taskId ? { ...result, status: 'waiting', error: undefined } : result),
+                  updatedAt: new Date().toISOString(),
+                }),
+              }))
+              const replacement = await restartFailedResult(jobId, taskId, retries + 1)
+              if (replacement) pending.add(replacement)
+              else {
+                setState((s) => ({
+                  ...s,
+                  jobs: s.jobs.map((job) => job.id !== jobId ? job : {
+                    ...job,
+                    results: job.results.map((result) => result.taskId === taskId ? { ...result, status: 'fail', error: info.error || 'Provider recovery failed.' } : result),
+                    updatedAt: new Date().toISOString(),
+                  }),
+                }))
+              }
+              return
+            }
+
+            const finalError = info.status === 'fail' && info.retryable && retries >= 2
+              ? `Provider failed after 2 automatic recovery attempts. ${info.error || ''}`.trim()
+              : info.error
             setState((s) => ({
               ...s,
               jobs: s.jobs.map((job) => job.id !== jobId ? job : {
@@ -314,7 +351,7 @@ function App() {
                   ...result,
                   status: info.status,
                   imageUrl: info.imageUrl || result.imageUrl,
-                  error: info.error,
+                  error: finalError,
                 } : result),
                 updatedAt: new Date().toISOString(),
               }),
@@ -352,6 +389,72 @@ function App() {
       }))
     } finally {
       pollingJobs.current.delete(jobId)
+    }
+  }
+
+  async function restartFailedResult(jobId: string, failedTaskId: string, nextRetryCount: number): Promise<string | null> {
+    try {
+      const snapshot = stateRef.current
+      const job = snapshot.jobs.find((j) => j.id === jobId)
+      if (!job) return null
+      const result = job.results.find((r) => r.taskId === failedTaskId)
+      const winner = snapshot.winners.find((w) => w.id === job.winnerId)
+      const product = snapshot.products.find((p) => p.id === job.productId)
+      if (!result || !winner || !product) return null
+
+      const winnerAsset = await getAsset(winner.assetId)
+      const productAssets = (await Promise.all(product.assetIds.slice(0, 3).map(getAsset))).filter(Boolean)
+      if (!winnerAsset || !productAssets.length) return null
+
+      const optimizedImages = await Promise.all([
+        optimizeDataUrl(winnerAsset.dataUrl),
+        ...productAssets.map((a) => optimizeDataUrl(a!.dataUrl)),
+      ]) as string[]
+      const [winnerImage, ...productImages] = optimizedImages
+      const response = await createGeneration({
+        winner,
+        winnerImage,
+        product,
+        productImages,
+        market: job.market,
+        outputLanguage: job.outputLanguage,
+        aspectRatio: job.aspectRatio,
+        model: job.model,
+        variations: 1,
+        cloneStrength: job.cloneStrength,
+        extraNotes: [job.extraNotes, `Automatic provider recovery for variation ${result.variation}. Preserve this variation's intended distinctness.`].filter(Boolean).join('\n'),
+      })
+      const replacementTaskId = response.taskIds[0]
+      if (!replacementTaskId) return null
+
+      setState((s) => ({
+        ...s,
+        jobs: s.jobs.map((j) => j.id !== jobId ? j : {
+          ...j,
+          status: 'generating',
+          results: j.results.map((r) => r.taskId === failedTaskId ? {
+            ...r,
+            taskId: replacementTaskId,
+            status: 'waiting',
+            error: undefined,
+            retryCount: nextRetryCount,
+            modelUsed: job.model,
+          } : r),
+          updatedAt: new Date().toISOString(),
+        }),
+      }))
+      return replacementTaskId
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Automatic provider recovery failed.'
+      setState((s) => ({
+        ...s,
+        jobs: s.jobs.map((j) => j.id !== jobId ? j : {
+          ...j,
+          results: j.results.map((r) => r.taskId === failedTaskId ? { ...r, status: 'fail', error: message } : r),
+          updatedAt: new Date().toISOString(),
+        }),
+      }))
+      return null
     }
   }
 

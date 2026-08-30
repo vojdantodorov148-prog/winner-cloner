@@ -48,6 +48,8 @@ export type ResultImage = {
   status: 'waiting' | 'generating' | 'success' | 'fail'
   imageUrl?: string
   error?: string
+  retryCount?: number
+  modelUsed?: string
 }
 
 export type Job = {

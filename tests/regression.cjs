@@ -265,6 +265,18 @@ async function testStatusFailure() {
   const body = JSON.parse(out.body)
   assert.equal(body.status, 'fail')
   assert.equal(body.error, 'model rejected input')
+  assert.equal(body.retryable, false)
+}
+
+async function testStatusAsyncPlaygroundFailureIsRetryable() {
+  delete require.cache[require.resolve('../netlify/functions/status.js')]
+  const status = require('../netlify/functions/status.js')
+  global.fetch = async () => jsonResponse({ code: 200, data: { state: 'fail', failCode: '500', failMsg: 'generate playground failed, task id is blank' } })
+  const out = await status.handler({ httpMethod: 'GET', queryStringParameters: { taskId: 'task-created-successfully' } })
+  const body = JSON.parse(out.body)
+  assert.equal(body.status, 'fail')
+  assert.equal(body.retryable, true)
+  assert.match(body.error, /task id is blank/i)
 }
 
 async function testCredits() {
@@ -339,6 +351,7 @@ async function main() {
     testStatusNeverReturnsInputReference,
     testStatusSuccessWithoutUrlKeepsPolling,
     testStatusFailure,
+    testStatusAsyncPlaygroundFailureIsRetryable,
     testCredits,
     testDownloadUsesKieDownloadUrl,
     testAllModelRequestShapesAndGrokMigration,

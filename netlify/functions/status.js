@@ -21,13 +21,14 @@ exports.handler = async (event) => {
     const imageUrl = extractGeneratedResultUrl(data?.data)
     const error = data?.data?.failMsg || data?.data?.error || (status === 'fail' ? data?.msg : undefined)
     const progress = numberOrUndefined(data?.data?.progress)
+    const retryable = status === 'fail' && isRetryableProviderFailure(error, data?.data?.failCode)
 
     // A successful task should normally include resultJson. If Kie reports
     // success a fraction of a second before the generated URL is populated,
     // keep polling instead of incorrectly completing the result with no image.
     if (status === 'success' && !imageUrl) status = 'generating'
 
-    return json(200, { status, imageUrl, error, progress })
+    return json(200, { status, imageUrl, error, progress, retryable })
   } catch (err) {
     const message = err?.name === 'AbortError'
       ? 'Kie status request timed out. The app will retry automatically.'
@@ -111,6 +112,14 @@ function parseMaybeJson(value) {
   try { return JSON.parse(text) } catch { return value }
 }
 
+
+function isRetryableProviderFailure(error, failCode) {
+  const code = String(failCode || '').toLowerCase()
+  const text = String(error || '').toLowerCase()
+  if (/^(408|425|429|500|502|503|504)$/.test(code)) return true
+  return /task id is blank|taskid.*blank|playground failed|temporar|timeout|timed out|busy|overload|upstream|gateway|internal|try again|network|fetch failed|aborted/.test(text)
+}
+
 function numberOrUndefined(value) {
   const n = Number(value)
   return Number.isFinite(n) ? n : undefined
@@ -144,4 +153,4 @@ function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)) }
 function json(statusCode, body) { return { statusCode, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, body: JSON.stringify(body) } }
 
 // Exported only for local regression tests; Netlify ignores this property.
-exports._test = { extractGeneratedResultUrl, normalizeState, firstUrlFromResult }
+exports._test = { extractGeneratedResultUrl, normalizeState, firstUrlFromResult, isRetryableProviderFailure }

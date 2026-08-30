@@ -21,12 +21,12 @@ exports.handler = async (event) => {
     // Run independent preparation work in parallel. This keeps the synchronous
     // Netlify function comfortably below its execution window in normal cases.
     const uploadsPromise = Promise.all([
-      uploadDataUrl(body.winnerImage, `winner-${crypto.randomUUID()}.webp`, key),
-      ...body.productImages.slice(0, 5).map((data, i) => uploadDataUrl(data, `product-${i + 1}-${crypto.randomUUID()}.webp`, key)),
+      uploadDataUrl(body.winnerImage, `winner-${crypto.randomUUID()}${extensionFromDataUrl(body.winnerImage)}`, key),
+      ...body.productImages.slice(0, 5).map((data, i) => uploadDataUrl(data, `product-${i + 1}-${crypto.randomUUID()}${extensionFromDataUrl(data)}`, key)),
     ])
     const pageContextPromise = collectPageContext(body.product.links || {})
     const [[winnerUrl, ...productUrls], pageContext] = await Promise.all([uploadsPromise, pageContextPromise])
-    console.log('Winner Cloner v1.0.6 preparation ms', Date.now() - startedAt)
+    console.log('Winner Cloner v1.0.7 preparation ms', Date.now() - startedAt)
 
     const master = await runPromptMaster({ ...body, winnerUrl, productUrls, pageContext }, key)
 
@@ -40,10 +40,11 @@ exports.handler = async (event) => {
         `\nOUTPUT REQUIREMENT: aspect ratio ${body.aspectRatio}. Render a finished static ad, not a mockup.`,
       ].join('')
       const prompt = fitPromptForModel(rawPrompt, body.model)
+      console.log('Winner Cloner image task', { model: body.model, promptChars: prompt.length, refs: refs.length, aspectRatio: body.aspectRatio })
       return createImageTask(body.model, prompt, refs, body.aspectRatio, key)
     })
     const taskAttempts = await runSettledInBatches(taskFactories, 6)
-    console.log('Winner Cloner v1.0.6 total create ms', Date.now() - startedAt, 'promptMode', master.mode || 'unknown')
+    console.log('Winner Cloner v1.0.7 total create ms', Date.now() - startedAt, 'promptMode', master.mode || 'unknown')
 
     const taskIds = taskAttempts.filter((r) => r.status === 'fulfilled').map((r) => r.value)
     const failed = taskAttempts.filter((r) => r.status === 'rejected')
@@ -78,6 +79,15 @@ function validate(body) {
   if (!Number.isFinite(variations) || variations < 1 || variations > 6) throw new Error('Variations must be between 1 and 6.')
 }
 
+function extensionFromDataUrl(dataUrl) {
+  const mime = String(dataUrl || '').match(/^data:([^;,]+)[;,]/i)?.[1]?.toLowerCase() || ''
+  if (mime === 'image/png') return '.png'
+  if (mime === 'image/jpeg' || mime === 'image/jpg') return '.jpg'
+  if (mime === 'image/webp') return '.webp'
+  if (mime === 'image/gif') return '.gif'
+  return '.img'
+}
+
 async function uploadDataUrl(dataUrl, filename, key) {
   const { response, data } = await fetchJsonWithRetry(`${UPLOAD_BASE}/api/file-base64-upload`, {
     method: 'POST',
@@ -85,7 +95,10 @@ async function uploadDataUrl(dataUrl, filename, key) {
     body: JSON.stringify({ base64Data: dataUrl, uploadPath: 'winner-cloner', fileName: filename }),
   }, { timeoutMs: 7000, retries: 1 })
   if (!response.ok || data.success === false) throw new Error(`Kie file upload failed: ${data.msg || response.status}`)
-  const url = data?.data?.downloadUrl || data?.data?.fileUrl
+  // Prefer the direct public file URL for downstream image models. The
+  // download URL may be a download/redirect endpoint, which is fine for a
+  // browser but less reliable as an image_input reference.
+  const url = data?.data?.fileUrl || data?.data?.downloadUrl
   if (!url) throw new Error('Kie upload did not return a file URL.')
   return url
 }
@@ -382,7 +395,7 @@ async function fetchSafePage(rawUrl) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 4000)
   try {
-    const response = await fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'User-Agent': 'WinnerCloner/1.0.6' } })
+    const response = await fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'User-Agent': 'WinnerCloner/1.0.7' } })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const contentType = response.headers.get('content-type') || ''
     if (!contentType.includes('text/html') && !contentType.includes('text/plain')) throw new Error('Page is not text/HTML')
@@ -601,7 +614,13 @@ function normalizeImageModel(model) {
 }
 
 function promptLimitForModel(model) {
-  return normalizeImageModel(model) === 'grok-imagine-image-2-0/image-to-image' ? 4200 : 7500
+  const normalized = normalizeImageModel(model)
+  // Keep Google image prompts conservative. Kie accepts the task envelope
+  // before the upstream image provider validates every field, so an oversized
+  // prompt can surface later as an opaque async provider failure.
+  if (normalized === 'nano-banana-pro' || normalized === 'nano-banana-2') return 4500
+  if (normalized === 'grok-imagine-image-2-0/image-to-image') return 4200
+  return 7000
 }
 
 function fitPromptForModel(prompt, model) {
