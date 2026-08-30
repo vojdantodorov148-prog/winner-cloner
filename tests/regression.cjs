@@ -31,8 +31,14 @@ async function testGenerateArrayContentAndTaskCreation() {
       return jsonResponse({ success: true, code: 200, data: { downloadUrl: `https://tempfile.redpandaai.co/ref-${uploadIndex}.webp` } })
     }
     if (u.includes('gemini-2.5-pro')) {
+      const req = JSON.parse(opts.body)
+      assert.equal(req.response_format?.type, 'json_schema')
+      assert.equal(req.response_format?.json_schema?.name, 'prompt_master_payload')
+      assert.equal(req.response_format?.json_schema?.schema?.type, 'object')
+      assert.ok(req.response_format?.json_schema?.schema?.properties?.final_image_prompt)
       const payload = {
-        summary: 'ok', blueprint: { layout: 'same' },
+        summary: 'ok',
+        blueprint: { layout: 'same', copy_structure: '', visual_style: '', persuasion_mechanism: '', product_placement: '', trust_elements: '', text_density: '' },
         final_image_prompt: 'A'.repeat(9000),
         variations: [{ instruction: 'v1' }, { instruction: 'v2' }],
       }
@@ -57,21 +63,26 @@ async function testGenerateArrayContentAndTaskCreation() {
 async function testGenerateRecovery() {
   delete require.cache[require.resolve('../netlify/functions/generate.js')]
   const generate = require('../netlify/functions/generate.js')
-  let geminiCalls = 0
+  let proCalls = 0
+  let flashCalls = 0
   global.fetch = async (url) => {
     const u = String(url)
     if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
     if (u.includes('gemini-2.5-pro')) {
-      geminiCalls++
-      if (geminiCalls === 1) return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'missing prompt' }) } }] })
-      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'recovered', blueprint: {}, final_image_prompt: 'valid final prompt', variations: [] }) } }] })
+      proCalls++
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'missing prompt' }) } }] })
+    }
+    if (u.includes('gemini-2.5-flash')) {
+      flashCalls++
+      return jsonResponse({ choices: [{ message: { content: 'Create a finished 4:5 static ad that preserves the winner layout exactly, uses the supplied product packaging reference faithfully, and renders concise market-native copy with the same hierarchy and text density.' } }] })
     }
     if (u.includes('/api/v1/jobs/createTask')) return jsonResponse({ code: 200, data: { taskId: 'task-recovered' } })
     throw new Error(`Unexpected fetch ${u}`)
   }
   const out = await generate.handler({ httpMethod: 'POST', body: JSON.stringify(basePayload({ variations: 1 })) })
   assert.equal(out.statusCode, 200, out.body)
-  assert.equal(geminiCalls, 2)
+  assert.equal(proCalls, 1)
+  assert.equal(flashCalls, 1)
   assert.deepEqual(JSON.parse(out.body).taskIds, ['task-recovered'])
 }
 
@@ -90,7 +101,7 @@ async function testPromptMasterSchemaFallback() {
         return jsonResponse({ msg: 'unsupported response_format envelope' }, 400)
       }
       assert.equal(body.response_format, undefined)
-      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'fallback ok', blueprint: {}, final_image_prompt: 'prompt', variations: [] }) } }] })
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'fallback ok', blueprint: {}, final_image_prompt: 'Create a finished static ad that preserves the winner layout, hierarchy, product placement, text density and product fidelity while adapting the copy for the selected market.', variations: [] }) } }] })
     }
     if (u.includes('/api/v1/jobs/createTask')) return jsonResponse({ code: 200, data: { taskId: 'task-schema-fallback' } })
     throw new Error(`Unexpected fetch ${u}`)
@@ -101,6 +112,28 @@ async function testPromptMasterSchemaFallback() {
   assert.deepEqual(JSON.parse(out.body).taskIds, ['task-schema-fallback'])
 }
 
+async function testDeterministicPromptMasterSafetyFallback() {
+  delete require.cache[require.resolve('../netlify/functions/generate.js')]
+  const generate = require('../netlify/functions/generate.js')
+  let createBody
+  global.fetch = async (url, opts = {}) => {
+    const u = String(url)
+    if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
+    if (u.includes('gemini-2.5-pro')) return jsonResponse({ choices: [{ message: { content: '' } }] })
+    if (u.includes('gemini-2.5-flash')) return jsonResponse({ choices: [{ message: { content: '' } }] })
+    if (u.includes('/api/v1/jobs/createTask')) {
+      createBody = JSON.parse(opts.body)
+      return jsonResponse({ code: 200, data: { taskId: 'task-safety' } })
+    }
+    throw new Error(`Unexpected fetch ${u}`)
+  }
+  const out = await generate.handler({ httpMethod: 'POST', body: JSON.stringify(basePayload({ variations: 1 })) })
+  assert.equal(out.statusCode, 200, out.body)
+  assert.deepEqual(JSON.parse(out.body).taskIds, ['task-safety'])
+  assert.ok(createBody.input.prompt.includes('PROMPT MASTER'))
+  assert.ok(createBody.input.prompt.includes('Reference image #1'))
+}
+
 async function testPartialTaskCreationStillReturnsSuccess() {
   delete require.cache[require.resolve('../netlify/functions/generate.js')]
   const generate = require('../netlify/functions/generate.js')
@@ -108,7 +141,7 @@ async function testPartialTaskCreationStillReturnsSuccess() {
   global.fetch = async (url) => {
     const u = String(url)
     if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
-    if (u.includes('gemini-2.5-pro')) return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'ok', blueprint: {}, final_image_prompt: 'prompt', variations: [] }) } }] })
+    if (u.includes('gemini-2.5-pro')) return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'ok', blueprint: {}, final_image_prompt: 'Create a finished static ad that preserves the winner layout, hierarchy, product placement, text density and product fidelity while adapting the copy for the selected market.', variations: [] }) } }] })
     if (u.includes('/api/v1/jobs/createTask')) {
       task++
       return task === 1 ? jsonResponse({ code: 400, msg: 'bad task' }, 400) : jsonResponse({ code: 200, data: { taskId: 'task-good' } })
@@ -205,7 +238,7 @@ async function testAllModelRequestShapesAndGrokMigration() {
     global.fetch = async (url, opts = {}) => {
       const u = String(url)
       if (u.includes('file-base64-upload')) return jsonResponse({ success: true, data: { downloadUrl: 'https://tempfile.redpandaai.co/ref.webp' } })
-      if (u.includes('gemini-2.5-pro')) return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'ok', blueprint: {}, final_image_prompt: 'prompt', variations: [] }) } }] })
+      if (u.includes('gemini-2.5-pro')) return jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: 'ok', blueprint: {}, final_image_prompt: 'Create a finished static ad that preserves the winner layout, hierarchy, product placement, text density and product fidelity while adapting the copy for the selected market.', variations: [] }) } }] })
       if (u.includes('/api/v1/jobs/createTask')) {
         createBody = JSON.parse(opts.body)
         return jsonResponse({ code: 200, data: { taskId: 'task-model' } })
@@ -225,6 +258,7 @@ async function main() {
     testGenerateArrayContentAndTaskCreation,
     testGenerateRecovery,
     testPromptMasterSchemaFallback,
+    testDeterministicPromptMasterSafetyFallback,
     testPartialTaskCreationStillReturnsSuccess,
     testStatusNeverReturnsInputReference,
     testStatusSuccessWithoutUrlKeepsPolling,

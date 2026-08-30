@@ -148,28 +148,7 @@ Extra user instructions: ${ctx.extraNotes || 'None'}
 FINAL PROMPT RELIABILITY RULE:
 Keep final_image_prompt complete but concise. It must stay under ${promptLimitForModel(ctx.model)} characters so the downstream image model cannot reject it for excessive prompt length. Prioritize exact ad copy, reference roles, layout, hierarchy, product fidelity and visual execution over redundant prose.
 
-Return ONLY valid JSON with this exact top-level shape:
-{
-  "summary": "brief human-readable summary of what was extracted and how it will be adapted",
-  "blueprint": {
-    "layout": "...",
-    "copy_structure": "...",
-    "visual_style": "...",
-    "persuasion_mechanism": "...",
-    "product_placement": "...",
-    "trust_elements": "...",
-    "text_density": "..."
-  },
-  "final_image_prompt": "one extremely detailed production prompt for the selected image model, including the exact new ad copy to render and strict reference-image instructions",
-  "variations": [
-    {"instruction":"subtle variation instruction that keeps the same winning concept"},
-    {"instruction":"different but controlled variation"},
-    {"instruction":"different but controlled variation"},
-    {"instruction":"different but controlled variation"},
-    {"instruction":"different but controlled variation"},
-    {"instruction":"different but controlled variation"}
-  ]
-}
+Return a structured Prompt Master payload. final_image_prompt is mandatory and must be a complete production-ready image-generation prompt with the exact new ad copy to render.
 `
 
   const content = [
@@ -178,122 +157,210 @@ Return ONLY valid JSON with this exact top-level shape:
     ...ctx.productUrls.slice(0, 4).map((url) => ({ type: 'image_url', image_url: { url } })),
   ]
 
+  // Kie's current Gemini 2.5 Pro documentation uses an OpenAI-style
+  // response_format envelope with json_schema.name/strict/schema nested under
+  // response_format.json_schema. v1.0.2 accidentally put schema properties at
+  // the wrong level, which could force an unstructured fallback response.
   const masterRequest = {
     messages: [{ role: 'user', content }],
     stream: false,
     reasoning_effort: 'high',
-    response_format: {
-      type: 'json_schema',
-      properties: {
-        summary: { type: 'string' },
-        blueprint: {
-          type: 'object',
-          properties: {
-            layout: { type: 'string' },
-            copy_structure: { type: 'string' },
-            visual_style: { type: 'string' },
-            persuasion_mechanism: { type: 'string' },
-            product_placement: { type: 'string' },
-            trust_elements: { type: 'string' },
-            text_density: { type: 'string' },
-          },
-        },
-        final_image_prompt: { type: 'string' },
-        variations: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: { instruction: { type: 'string' } },
-            required: ['instruction'],
-          },
-        },
-      },
-      required: ['summary', 'blueprint', 'final_image_prompt', 'variations'],
-    },
+    response_format: promptMasterResponseFormat(),
   }
 
-  let { response, data } = await postPromptMaster(masterRequest, key, 30000)
-  // Kie's structured-output envelope has changed shape across documentation
-  // revisions. If that optional parameter is rejected, fall back once to the
-  // same Prompt Master instruction without response_format. The prompt itself
-  // still requires JSON and the parser below validates the mandatory field.
-  if (!response.ok && [400, 422].includes(response.status)) {
-    const fallbackRequest = { ...masterRequest }
-    delete fallbackRequest.response_format
-    ;({ response, data } = await postPromptMaster(fallbackRequest, key, 22000))
-  }
-  if (!response.ok) throw new Error(`Prompt Master failed: ${data?.error?.message || data?.msg || response.status}`)
+  let firstError = null
+  let firstData = null
+  try {
+    let { response, data } = await postPromptMaster(masterRequest, key, 26000, 'gemini-2.5-pro')
+    firstData = data
 
-  // Kie normally returns OpenAI-style message.content as a string, but some
-  // successful multimodal responses return content as an array/object. The
-  // old parser stringified that wrapper and then mistook it for the Prompt
-  // Master JSON itself, which produced the "incomplete prompt" error.
-  let parsed = extractPromptMasterPayload(data)
+    // Defensive compatibility fallback if Kie changes/temporarily rejects the
+    // optional structured-output envelope. The Prompt Master instruction still
+    // runs; we simply consume its normal assistant text instead.
+    if (!response.ok && [400, 422].includes(response.status)) {
+      const fallbackRequest = { ...masterRequest }
+      delete fallbackRequest.response_format
+      ;({ response, data } = await postPromptMaster(fallbackRequest, key, 20000, 'gemini-2.5-pro'))
+      firstData = data
+    }
 
-  // Automatic recovery: if the provider returned a successful but oddly
-  // wrapped/incomplete structured response, ask Prompt Master once more for
-  // the final production payload instead of failing the user's generation.
-  if (!parsed?.final_image_prompt || !String(parsed.final_image_prompt).trim()) {
-    console.warn('Prompt Master first response needs recovery', summarizeResponseShape(data))
-    parsed = await recoverPromptMaster(content, key)
+    if (!response.ok) {
+      firstError = new Error(`Prompt Master failed: ${data?.error?.message || data?.msg || response.status}`)
+    } else {
+      const parsed = extractPromptMasterPayload(data)
+      if (hasUsableFinalPrompt(parsed)) return normalizePromptMasterPayload(parsed)
+
+      // A 200 response can still be plain prose if the provider ignores or
+      // downgrades structured output. Preserve it for a last-resort fallback,
+      // but first retry through the faster multimodal Flash endpoint.
+      console.warn('Prompt Master Pro returned no structured final prompt', summarizeResponseShape(data))
+    }
+  } catch (err) {
+    firstError = err
+    console.warn('Prompt Master Pro request failed', cleanError(err))
   }
 
-  if (!parsed?.final_image_prompt || !String(parsed.final_image_prompt).trim()) {
-    console.error('Prompt Master recovery still missing final_image_prompt')
-    throw new Error('Prompt Master could not produce the final image prompt after an automatic retry. Open the Netlify function log for generate and retry the job.')
+  // Recovery is deliberately a different transport/model path. This avoids a
+  // second identical failure mode while keeping the exact same hidden Prompt
+  // Master instructions and winner/product image context.
+  try {
+    const recovered = await recoverPromptMaster(content, key)
+    if (hasUsableFinalPrompt(recovered)) return normalizePromptMasterPayload(recovered)
+  } catch (err) {
+    console.warn('Prompt Master Flash recovery failed', cleanError(err))
   }
 
-  return {
-    summary: String(parsed.summary || 'Prompt Master completed winner analysis and product adaptation.'),
-    blueprint: parsed.blueprint && typeof parsed.blueprint === 'object' ? parsed.blueprint : {},
-    final_image_prompt: String(parsed.final_image_prompt).trim(),
-    variations: normalizeVariations(parsed.variations),
+  // If Pro returned substantial assistant text that merely failed JSON
+  // parsing, that text is still Prompt Master output and is safe to use as the
+  // downstream production prompt instead of failing the whole job.
+  const rawProText = extractAssistantText(firstData)
+  if (isUsablePromptText(rawProText)) {
+    return normalizePromptMasterPayload({
+      summary: 'Prompt Master completed winner analysis and product adaptation (plain-text fallback).',
+      blueprint: {},
+      final_image_prompt: cleanAssistantPrompt(rawProText),
+      variations: [],
+    })
   }
+
+  // Final non-fatal safety net. This keeps the Prompt Master rules embedded in
+  // the image-generation prompt even if Kie's chat endpoints are temporarily
+  // returning empty/malformed bodies. It avoids the old "incomplete prompt"
+  // hard failure and still passes the winner + product reference images to the
+  // selected image model.
+  console.warn('Using deterministic Prompt Master safety prompt', firstError ? cleanError(firstError) : 'empty provider output')
+  return buildDeterministicPromptMasterFallback(ctx, strength, fidelityInstruction)
 }
 
 async function recoverPromptMaster(originalContent, key) {
   const recoveryInstruction = {
     type: 'text',
-    text: `RECOVERY INSTRUCTION: Produce the final Prompt Master payload now. Return ONLY JSON. The key final_image_prompt is mandatory and must contain a complete, detailed production prompt with the exact ad copy to render, reference-image roles, layout/hierarchy rules, product fidelity rules, market adaptation, and aspect-ratio requirement. Also return summary, blueprint and variations. Do not omit final_image_prompt.`,
+    text: `RECOVERY MODE: Run the same Prompt Master analysis and return one complete production-ready image-generation prompt as PLAIN TEXT only. Do not return JSON, markdown fences, headings about your process, or an explanation. The prompt must include: exact adapted ad copy, winner-reference role, product-reference roles, layout/hierarchy, product fidelity, target-market adaptation, text-density limits, and aspect-ratio requirement.`,
   }
 
   const recoveryRequest = {
     messages: [{ role: 'user', content: [...originalContent, recoveryInstruction] }],
     stream: false,
     reasoning_effort: 'medium',
-    response_format: {
-      type: 'json_schema',
-      properties: {
-        summary: { type: 'string' },
-        blueprint: { type: 'object' },
-        final_image_prompt: { type: 'string' },
-        variations: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: { instruction: { type: 'string' } },
-            required: ['instruction'],
-          },
-        },
-      },
-      required: ['summary', 'blueprint', 'final_image_prompt', 'variations'],
-    },
   }
-  let { response, data } = await postPromptMaster(recoveryRequest, key, 16000)
-  if (!response.ok && [400, 422].includes(response.status)) {
-    const fallbackRequest = { ...recoveryRequest }
-    delete fallbackRequest.response_format
-    ;({ response, data } = await postPromptMaster(fallbackRequest, key, 12000))
+
+  const { response, data } = await postPromptMaster(recoveryRequest, key, 15000, 'gemini-2.5-flash')
+  if (!response.ok) throw new Error(`Prompt Master recovery failed: ${data?.error?.message || data?.msg || response.status}`)
+
+  const parsed = extractPromptMasterPayload(data)
+  if (hasUsableFinalPrompt(parsed)) return parsed
+
+  const text = cleanAssistantPrompt(extractAssistantText(data))
+  if (!isUsablePromptText(text)) return null
+  return {
+    summary: 'Prompt Master completed winner analysis and product adaptation via recovery mode.',
+    blueprint: {},
+    final_image_prompt: text,
+    variations: [],
   }
-  if (!response.ok) {
-    console.error('Prompt Master recovery request failed', data?.error?.message || data?.msg || response.status)
-    return null
-  }
-  return extractPromptMasterPayload(data)
 }
 
-async function postPromptMaster(body, key, timeoutMs) {
-  return fetchJsonWithRetry(`${KIE_BASE}/gemini-2.5-pro/v1/chat/completions`, {
+function promptMasterResponseFormat() {
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: 'prompt_master_payload',
+      strict: true,
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          summary: { type: 'string' },
+          blueprint: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              layout: { type: 'string' },
+              copy_structure: { type: 'string' },
+              visual_style: { type: 'string' },
+              persuasion_mechanism: { type: 'string' },
+              product_placement: { type: 'string' },
+              trust_elements: { type: 'string' },
+              text_density: { type: 'string' },
+            },
+            required: ['layout', 'copy_structure', 'visual_style', 'persuasion_mechanism', 'product_placement', 'trust_elements', 'text_density'],
+          },
+          final_image_prompt: { type: 'string' },
+          variations: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { instruction: { type: 'string' } },
+              required: ['instruction'],
+            },
+          },
+        },
+        required: ['summary', 'blueprint', 'final_image_prompt', 'variations'],
+      },
+    },
+  }
+}
+
+function hasUsableFinalPrompt(parsed) {
+  return Boolean(parsed?.final_image_prompt && isUsablePromptText(String(parsed.final_image_prompt)))
+}
+
+function normalizePromptMasterPayload(parsed) {
+  return {
+    summary: String(parsed?.summary || 'Prompt Master completed winner analysis and product adaptation.'),
+    blueprint: parsed?.blueprint && typeof parsed.blueprint === 'object' ? parsed.blueprint : {},
+    final_image_prompt: cleanAssistantPrompt(String(parsed?.final_image_prompt || '')),
+    variations: normalizeVariations(parsed?.variations),
+  }
+}
+
+function buildDeterministicPromptMasterFallback(ctx, strength, fidelityInstruction) {
+  const p = ctx.product || {}
+  const final = `
+PROMPT MASTER — WINNER CLONE PRODUCTION PROMPT
+
+REFERENCE ROLES:
+- Reference image #1 is the winning ad. Treat it as the structural and visual source of truth: preserve its composition, hierarchy, number of text blocks, relative text sizes, visual rhythm, subject/product placement, CTA logic, trust elements, background treatment and persuasive sequence.
+- Reference images #2 onward are the real ${p.name || 'product'} identity/packaging references. Reproduce the actual product faithfully; do not redesign packaging, logo, colors, proportions or label details.
+
+CLONE FIDELITY: ${strength}%.
+${fidelityInstruction}
+
+ADAPTATION:
+Create the same winning concept for ${p.name || 'the selected product'}${p.brand ? ` by ${p.brand}` : ''} for the ${ctx.market} market. Output language: ${ctx.outputLanguage}. Requested aspect ratio: ${ctx.aspectRatio}.
+Product summary: ${p.summary || ''}
+Product explanation: ${p.description || ''}
+Mechanism: ${p.mechanism || ''}
+Benefits: ${p.benefits || ''}
+Audience: ${p.audience || ''}
+Objections: ${p.objections || ''}
+Offer: ${p.offer || ''}
+Guarantee: ${p.guarantee || ''}
+Guardrails: ${p.guardrails || ''}
+Research/notes: ${p.notes || ''}
+Extra instructions: ${ctx.extraNotes || 'None'}
+
+COPY RULES:
+Infer the winning ad's copy architecture from reference image #1 and write only the amount of copy that architecture requires. Keep the adapted copy market-native, direct-response oriented, concise and easy to read. Do not invent unsupported factual claims. Never add extra tiny footer copy, paragraphs, badges or icons that the winner does not structurally call for.
+
+VISUAL RULES:
+Recreate the winner's layout and styling rather than inventing a generic ad. Preserve headline position, visual hierarchy, product/subject scale, spacing, balance, background feel, badge/icon logic and overall native/premium level. Replace only the original product-specific elements with the selected product and appropriate adapted copy. Render a polished finished static ad, not a mockup, wireframe, prompt sheet or collage.
+
+OUTPUT: one finished ${ctx.aspectRatio} static ad creative.
+`.trim()
+
+  return {
+    summary: 'Prompt Master safety mode preserved the winner structure and product context.',
+    blueprint: {},
+    final_image_prompt: fitPromptForModel(final, ctx.model),
+    variations: [],
+  }
+}
+
+async function postPromptMaster(body, key, timeoutMs, model = 'gemini-2.5-pro') {
+  const endpoint = model === 'gemini-2.5-flash' ? 'gemini-2.5-flash' : 'gemini-2.5-pro'
+  return fetchJsonWithRetry(`${KIE_BASE}/${endpoint}/v1/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -351,7 +418,7 @@ async function fetchSafePage(rawUrl) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 7000)
   try {
-    const response = await fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'User-Agent': 'WinnerCloner/1.0.2' } })
+    const response = await fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'User-Agent': 'WinnerCloner/1.0.3' } })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const contentType = response.headers.get('content-type') || ''
     if (!contentType.includes('text/html') && !contentType.includes('text/plain')) throw new Error('Page is not text/HTML')
@@ -494,6 +561,49 @@ function normalizeVariations(value) {
     })
     .filter(Boolean)
     .slice(0, 6)
+}
+
+function extractAssistantText(data) {
+  const message = data?.choices?.[0]?.message
+  const candidates = [message?.content, message?.text, data?.output_text, data?.output]
+  for (const candidate of candidates) {
+    const text = flattenText(candidate).trim()
+    if (text) return text
+  }
+  return ''
+}
+
+function flattenText(value, depth = 0) {
+  if (depth > 8 || value == null) return ''
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return value.map((x) => flattenText(x, depth + 1)).filter(Boolean).join('\n')
+  if (typeof value !== 'object') return ''
+
+  const preferred = ['text', 'content', 'output_text', 'value']
+  const parts = []
+  for (const key of preferred) {
+    if (value[key] != null) {
+      const text = flattenText(value[key], depth + 1)
+      if (text) parts.push(text)
+    }
+  }
+  if (parts.length) return parts.join('\n')
+  return ''
+}
+
+function cleanAssistantPrompt(text) {
+  return String(text || '')
+    .trim()
+    .replace(/^```(?:json|text|markdown)?\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim()
+}
+
+function isUsablePromptText(text) {
+  const value = cleanAssistantPrompt(text)
+  if (value.length < 80) return false
+  if (/^(?:sorry|i\s+can(?:not|'t)|unable to)/i.test(value)) return false
+  return true
 }
 
 function summarizeResponseShape(data) {

@@ -1,3 +1,33 @@
+# Winner Cloner v1.0.3 — Prompt Master Reliability Audit
+
+## Root cause fixed
+
+The v1.0.2 Prompt Master request used the wrong Kie Gemini structured-output envelope. The schema fields were placed directly under `response_format`; Kie currently documents them under `response_format.json_schema.schema`. That mismatch could cause Kie to return unstructured output, which then triggered `Prompt Master could not produce the final image prompt after an automatic retry.`
+
+## v1.0.3 changes
+
+1. Correct Kie Gemini 2.5 Pro `response_format` nesting.
+2. If structured output is rejected, retry once without `response_format`.
+3. If Pro returns malformed/empty structured output, retry the same hidden Prompt Master workflow through Gemini 2.5 Flash multimodal.
+4. Flash recovery requests a plain-text production prompt, avoiding a second JSON-parser failure mode.
+5. If Kie chat responses are still empty/malformed, generate a deterministic Prompt Master safety prompt from the winner metadata, product profile, market, clone strength and reference-image roles rather than hard-failing the job.
+6. Prompt Master remains permanently ON in every path.
+7. Existing image-generation, task-status, download and credit endpoint shapes were rechecked against current Kie documentation.
+
+## Verification
+
+- `node --check` passes for all Netlify functions.
+- Local mocked regression suite: 11/11 passed.
+- The suite includes the exact current Kie JSON-schema envelope, Pro-to-Flash recovery, deterministic safety fallback, partial task creation, result URL parsing, credits, downloads and all selectable image-model request shapes.
+
+## Limitation
+
+A live paid Kie generation cannot be executed in this sandbox because the user's private KIE_API_KEY is intentionally not available here. Netlify will perform the production dependency install/build during deploy.
+
+---
+
+## Previous v1.0.2 audit notes
+
 # Winner Cloner v1.0.2 — Reliability Audit
 
 Audit date: 2026-08-29

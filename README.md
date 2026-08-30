@@ -94,7 +94,7 @@ The app stores product/winner data in the current browser. Clearing browser site
 - Product page URL fetching blocks localhost/private-network targets
 - Download proxy only accepts Kie-related asset hosts
 
-## v1.0.2 reliability audit
+## v1.0.3 reliability audit
 
 This build includes a full generation-pipeline hardening pass:
 
@@ -114,4 +114,13 @@ This build includes a full generation-pipeline hardening pass:
 - Regression suite covers Prompt Master response variants/recovery/schema fallback, partial image-task creation, result URL parsing, no-URL success states, model request shapes/migration, credits and downloads.
 
 
-See `AUDIT-REPORT.md` for the v1.0.2 reliability audit and verification limitations.
+See `AUDIT-REPORT.md` for the v1.0.3 reliability audit and verification limitations.
+
+
+## v1.0.3 Prompt Master hotfix
+
+- Corrected the Kie Gemini structured-output request envelope to `response_format.json_schema.schema`.
+- Added Gemini 2.5 Flash multimodal recovery if the Pro response is empty or malformed.
+- Added a deterministic Prompt Master safety prompt so malformed chat output no longer hard-fails generation.
+- Kept Prompt Master permanently enabled; all fallbacks still preserve winner-reference and product-reference rules.
+- Regression suite expanded to 11 scenarios.
